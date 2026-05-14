@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod mail;
 mod mcp;
 mod permissions;
 mod tui;

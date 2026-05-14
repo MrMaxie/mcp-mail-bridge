@@ -11,7 +11,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{config::Config, permissions::Permission};
+use crate::{config::Config, mail, permissions::Permission};
 
 #[derive(Debug, Clone)]
 pub struct MailBridgeServer {
@@ -20,8 +20,13 @@ pub struct MailBridgeServer {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct AccountRequest {
+pub struct ListMessagesRequest {
   pub account_id: String,
+  pub query: Option<String>,
+  pub start_unix: Option<i64>,
+  pub end_unix: Option<i64>,
+  pub limit: Option<u32>,
+  pub page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -58,17 +63,45 @@ impl MailBridgeServer {
     Config::load_or_default(&self.database_path).map_err(|error| error.to_string())
   }
 
-  fn require_permission(&self, account_id: &str, permission: Permission) -> Result<(), String> {
-    let config = self.load_config()?;
-    let account = config
-      .find_account(account_id)
-      .map_err(|error| error.to_string())?;
-    if account.allows(permission) {
-      Ok(())
-    } else {
-      Err(format!(
-        "account '{account_id}' does not allow '{permission}'"
-      ))
+  fn run_with_adapter<T, F>(&self, account_id: &str, permission: Permission, action: F) -> String
+  where
+    F: FnOnce(&dyn mail::MailAdapter) -> Result<T, mail::MailError>,
+    T: Serialize,
+  {
+    let config = match self.load_config() {
+      Ok(config) => config,
+      Err(error) => return json!({ "error": error }).to_string(),
+    };
+
+    let account = match config.find_account(account_id) {
+      Ok(account) => account,
+      Err(error) => return json!({ "error": error.to_string() }).to_string(),
+    };
+
+    if !account.allows(permission) {
+      return json!({
+        "error": format!("account '{account_id}' does not allow '{permission}'")
+      })
+      .to_string();
+    }
+
+    let adapter = match mail::adapter_for(account) {
+      Ok(adapter) => adapter,
+      Err(error) => return json!({ "error": error.to_string() }).to_string(),
+    };
+
+    if let Err(error) = adapter.validate_account() {
+      return json!({ "error": error.to_string() }).to_string();
+    }
+
+    match action(adapter.as_ref()) {
+      Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|error| {
+        json!({
+          "error": format!("failed to serialize response: {error}")
+        })
+        .to_string()
+      }),
+      Err(error) => json!({ "error": error.to_string() }).to_string(),
     }
   }
 }
@@ -98,60 +131,57 @@ impl MailBridgeServer {
     result.unwrap_or_else(|error| json!({ "error": error }).to_string())
   }
 
-  #[tool(description = "List messages for an account. Mail backend implementation is pending.")]
-  fn list_messages(&self, Parameters(request): Parameters<AccountRequest>) -> String {
-    match self.require_permission(&request.account_id, Permission::Read) {
-      Ok(()) => json!({
-          "account_id": request.account_id,
-          "messages": [],
-          "status": "mail backend is not implemented yet"
-      })
-      .to_string(),
-      Err(error) => json!({ "error": error }).to_string(),
+  #[tool(description = "List messages for an account.")]
+  fn list_messages(&self, Parameters(request): Parameters<ListMessagesRequest>) -> String {
+    if let Err(error) =
+      mail::MessageDateWindow::new(request.start_unix, request.end_unix).validate()
+    {
+      return json!({ "error": error.to_string() }).to_string();
     }
+
+    let window = mail::MessageDateWindow::new(request.start_unix, request.end_unix);
+
+    self.run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
+      adapter.list_messages(&mail::ListMessagesRequest {
+        query: request.query,
+        window: Some(window),
+        limit: request.limit,
+        page_token: request.page_token,
+      })
+    })
   }
 
-  #[tool(description = "Read one message for an account. Mail backend implementation is pending.")]
+  #[tool(description = "Read one message for an account.")]
   fn read_message(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
-    match self.require_permission(&request.account_id, Permission::Read) {
-      Ok(()) => json!({
-          "account_id": request.account_id,
-          "message_id": request.message_id,
-          "status": "mail backend is not implemented yet"
-      })
-      .to_string(),
-      Err(error) => json!({ "error": error }).to_string(),
-    }
+    let message_id = request.message_id;
+    self.run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
+      adapter.read_message(&mail::ReadMessageRequest { message_id })
+    })
   }
 
-  #[tool(description = "Send a message from an account. Mail backend implementation is pending.")]
+  #[tool(description = "Send a message from an account.")]
   fn send_message(&self, Parameters(request): Parameters<SendMessageRequest>) -> String {
-    match self.require_permission(&request.account_id, Permission::Write) {
-      Ok(()) => json!({
-          "account_id": request.account_id,
-          "to": request.to,
-          "subject": request.subject,
-          "body_length": request.body.len(),
-          "status": "mail backend is not implemented yet"
-      })
-      .to_string(),
-      Err(error) => json!({ "error": error }).to_string(),
-    }
+    let message = mail::SendMessageRequest {
+      to: request.to,
+      subject: request.subject,
+      body: request.body,
+    };
+    self.run_with_adapter(&request.account_id, Permission::Write, move |adapter| {
+      adapter.send_message(&message)
+    })
   }
 
-  #[tool(
-    description = "Mark a message as read for an account. Mail backend implementation is pending."
-  )]
+  #[tool(description = "Mark a message as read for an account.")]
   fn mark_as_read(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
-    match self.require_permission(&request.account_id, Permission::MarkAsRead) {
-      Ok(()) => json!({
-          "account_id": request.account_id,
-          "message_id": request.message_id,
-          "status": "mail backend is not implemented yet"
-      })
-      .to_string(),
-      Err(error) => json!({ "error": error }).to_string(),
-    }
+    let message_id = request.message_id;
+    self.run_with_adapter(
+      &request.account_id,
+      Permission::MarkAsRead,
+      move |adapter| {
+        adapter.mark_as_read(&mail::ReadMessageRequest { message_id })?;
+        Ok(json!({ "status": "message marked as read" }))
+      },
+    )
   }
 }
 
