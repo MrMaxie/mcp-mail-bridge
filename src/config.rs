@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -68,6 +68,8 @@ pub enum ConfigError {
   UnknownPermission(String),
 }
 
+const CURRENT_SCHEMA_VERSION: i64 = 2;
+
 impl Config {
   pub fn load_or_default(path: &Path) -> Result<Self> {
     let connection = open_database(path)?;
@@ -120,14 +122,28 @@ impl Config {
     initialize_database(&connection)?;
     let transaction = connection.transaction()?;
 
-    transaction.execute("delete from account_permissions", [])?;
-    transaction.execute("delete from accounts", [])?;
+    let desired_account_ids: HashSet<String> =
+      self.accounts.iter().map(|account| account.id.clone()).collect();
+    let mut statement = transaction.prepare("select id from accounts")?;
+    let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for existing_account_id in existing_account_ids {
+      let existing_account_id = existing_account_id?;
+      if !desired_account_ids.contains(&existing_account_id) {
+        transaction.execute("delete from accounts where id = ?1", params![existing_account_id])?;
+      }
+    }
 
     for account in &self.accounts {
       transaction.execute(
         "insert into accounts (
                    id, email, provider, auth_kind, auth_username, auth_secret
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6)",
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(id) do update set
+                   email = excluded.email,
+                   provider = excluded.provider,
+                   auth_kind = excluded.auth_kind,
+                   auth_username = excluded.auth_username,
+                   auth_secret = excluded.auth_secret",
         params![
           account.id,
           account.email,
@@ -136,6 +152,11 @@ impl Config {
           account.auth.username,
           account.auth.secret,
         ],
+      )?;
+
+      transaction.execute(
+        "delete from account_permissions where account_id = ?1",
+        params![account.id],
       )?;
 
       for permission in &account.permissions {
@@ -295,6 +316,39 @@ fn open_database(path: &Path) -> Result<Connection> {
 }
 
 fn initialize_database(connection: &Connection) -> Result<()> {
+  let version = detect_schema_version(connection)?;
+  match version {
+    0 => initialize_fresh_schema(connection)?,
+    1 => {
+      migrate_schema_to_v2(connection)?;
+    }
+    CURRENT_SCHEMA_VERSION => {}
+    other => {
+      anyhow::bail!("unsupported database schema version '{other}'")
+    }
+  }
+  Ok(())
+}
+
+fn detect_schema_version(connection: &Connection) -> Result<i64> {
+  if !table_exists(connection, "schema_migrations")? {
+    if table_exists(connection, "accounts")? {
+      return Ok(1);
+    }
+    return Ok(0);
+  }
+
+  let version = connection
+    .query_row("select version from schema_migrations", [], |row| {
+      row.get::<_, i64>(0)
+    })
+    .optional()?
+    .unwrap_or(0);
+
+  Ok(version)
+}
+
+fn initialize_fresh_schema(connection: &Connection) -> Result<()> {
   connection.execute_batch(
     "create table if not exists accounts (
            id text primary key,
@@ -310,9 +364,157 @@ fn initialize_database(connection: &Connection) -> Result<()> {
            permission text not null,
            primary key (account_id, permission),
            foreign key (account_id) references accounts(id) on delete cascade
-         );",
+         );
+
+         create table if not exists message_metadata_cache (
+           account_id text not null,
+           cache_key text not null,
+           message_id text not null,
+           subject text,
+           sender text,
+           recipients text,
+           snippet text,
+           received_at integer,
+           is_read integer not null default 0,
+           remote_version text,
+           cached_at integer not null,
+           primary key (account_id, cache_key, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists message_body_cache (
+           account_id text not null,
+           cache_key text,
+           message_id text not null,
+           mime_type text,
+           body text,
+           fetched_at integer,
+           primary key (account_id, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists cache_windows (
+           account_id text not null,
+           cache_key text not null,
+           query text,
+           from_timestamp integer,
+           to_timestamp integer,
+           read_state text,
+           cursor text,
+           refreshed_at integer not null,
+           primary key (account_id, cache_key),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists message_remote_state (
+           account_id text not null,
+           message_id text not null,
+           is_read integer not null,
+           remote_state integer,
+           marker text,
+           updated_at integer not null,
+           primary key (account_id, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists sync_markers (
+           account_id text not null,
+           marker_key text not null,
+           marker_value text not null,
+           updated_at integer not null,
+           primary key (account_id, marker_key),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists schema_migrations (
+           version integer not null primary key
+         );
+
+         insert into schema_migrations (version) values (2);",
   )?;
   Ok(())
+}
+
+fn migrate_schema_to_v2(connection: &Connection) -> Result<()> {
+  connection.execute_batch(
+    "create table if not exists message_metadata_cache (
+           account_id text not null,
+           cache_key text not null,
+           message_id text not null,
+           subject text,
+           sender text,
+           recipients text,
+           snippet text,
+           received_at integer,
+           is_read integer not null default 0,
+           remote_version text,
+           cached_at integer not null,
+           primary key (account_id, cache_key, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists message_body_cache (
+           account_id text not null,
+           cache_key text,
+           message_id text not null,
+           mime_type text,
+           body text,
+           fetched_at integer,
+           primary key (account_id, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists cache_windows (
+           account_id text not null,
+           cache_key text not null,
+           query text,
+           from_timestamp integer,
+           to_timestamp integer,
+           read_state text,
+           cursor text,
+           refreshed_at integer not null,
+           primary key (account_id, cache_key),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists message_remote_state (
+           account_id text not null,
+           message_id text not null,
+           is_read integer not null,
+           remote_state integer,
+           marker text,
+           updated_at integer not null,
+           primary key (account_id, message_id),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+
+         create table if not exists sync_markers (
+           account_id text not null,
+           marker_key text not null,
+           marker_value text not null,
+           updated_at integer not null,
+           primary key (account_id, marker_key),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );
+         create table if not exists schema_migrations (
+           version integer not null primary key
+         );
+
+         delete from schema_migrations;
+         insert into schema_migrations (version) values (2);",
+  )?;
+  Ok(())
+}
+
+fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
+  let exists: Option<String> = connection
+    .query_row(
+      "select name from sqlite_master where type='table' and name = ?1",
+      params![table_name],
+      |row| row.get(0),
+    )
+    .optional()?;
+  Ok(exists.is_some())
 }
 
 fn load_permissions(connection: &Connection, account_id: &str) -> Result<Vec<Permission>> {
@@ -374,5 +576,147 @@ mod tests {
     let loaded = Config::load_or_default(&path).unwrap();
 
     assert_eq!(loaded.accounts[0].id, "work");
+  }
+
+  #[test]
+  fn loads_fresh_schema_version_2() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb.db");
+
+    let config = Config {
+      accounts: vec![account("work")],
+    };
+    config.save(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+      .query_row("select version from schema_migrations", [], |row| {
+        row.get(0)
+      })
+      .unwrap();
+
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+  }
+
+  #[test]
+  fn upgrades_legacy_schema_to_current_version() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_legacy.db");
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+      .execute_batch(
+        "create table accounts (
+           id text primary key,
+           email text not null,
+           provider text not null,
+           auth_kind text not null,
+           auth_username text,
+           auth_secret text not null
+         );
+
+         create table account_permissions (
+           account_id text not null,
+           permission text not null,
+           primary key (account_id, permission),
+           foreign key (account_id) references accounts(id) on delete cascade
+         );",
+      )
+      .unwrap();
+
+    connection
+      .execute(
+        "insert into accounts (id, email, provider, auth_kind, auth_username, auth_secret)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+          "work",
+          "work@example.com",
+          "imap_smtp",
+          "password",
+          "work",
+          "secret"
+        ],
+      )
+      .unwrap();
+    connection
+      .execute(
+        "insert into account_permissions (account_id, permission) values (?1, ?2)",
+        params!["work", "read"],
+      )
+      .unwrap();
+    drop(connection);
+
+    let config = Config::load_or_default(&path).unwrap();
+    assert_eq!(config.accounts[0].id, "work");
+
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+      .query_row("select version from schema_migrations", [], |row| {
+        row.get(0)
+      })
+      .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let cache_count: i64 = connection
+      .query_row(
+        "select count(name) from sqlite_master where type='table' and name = 'message_metadata_cache'",
+        [],
+        |row| row.get(0),
+      )
+      .unwrap();
+    assert_eq!(cache_count, 1);
+  }
+
+  #[test]
+  fn preserves_other_accounts_cache_data_during_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_cache.db");
+
+    let config = Config {
+      accounts: vec![account("work"), account("personal")],
+    };
+    config.save(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+      .execute(
+        "insert into message_metadata_cache (
+            account_id, cache_key, message_id, cached_at
+         ) values (?1, ?2, ?3, ?4)",
+        params!["work", "q-work", "work-message", 100],
+      )
+      .unwrap();
+    connection
+      .execute(
+        "insert into message_metadata_cache (
+            account_id, cache_key, message_id, cached_at
+         ) values (?1, ?2, ?3, ?4)",
+        params!["personal", "q-personal", "personal-message", 100],
+      )
+      .unwrap();
+    drop(connection);
+
+    let mut updated = config.clone();
+    updated.accounts[0].email = "work-updated@example.com".to_string();
+    updated.save(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let work_cache_count: i64 = connection
+      .query_row(
+        "select count(*) from message_metadata_cache where account_id = ?1",
+        ["work"],
+        |row| row.get(0),
+      )
+      .unwrap();
+    let personal_cache_count: i64 = connection
+      .query_row(
+        "select count(*) from message_metadata_cache where account_id = ?1",
+        ["personal"],
+        |row| row.get(0),
+      )
+      .unwrap();
+
+    assert_eq!(work_cache_count, 1);
+    assert_eq!(personal_cache_count, 1);
   }
 }
