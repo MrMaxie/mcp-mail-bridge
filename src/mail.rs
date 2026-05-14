@@ -332,6 +332,33 @@ impl GmailAdapter {
     }
   }
 
+  async fn fetch_message_summary(
+    client: Client,
+    access_token: String,
+    message_id: String,
+  ) -> Result<MessageSummary, MailError> {
+    let response = client
+      .get(format!("{GMAIL_BASE_URL}/messages/{message_id}"))
+      .bearer_auth(access_token)
+      .query(&[
+        ("format", "metadata"),
+        ("metadataHeaders", "From"),
+        ("metadataHeaders", "Subject"),
+        ("metadataHeaders", "To"),
+        ("fields", "id,threadId,snippet,labelIds,payload/headers"),
+      ])
+      .send()
+      .await
+      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+    let response = Self::request_success(response)?;
+    let response = response
+      .json::<GmailMessageResponse>()
+      .await
+      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+    Ok(Self::message_summary_from_metadata_response(&response))
+  }
+
   fn message_content_from_response(message: GmailMessageResponse) -> MessageContent {
     let payload = message.payload.clone();
     let headers =
@@ -358,34 +385,6 @@ impl GmailAdapter {
         .find(|label| label == "UNREAD")
         .is_none(),
     }
-  }
-
-  fn message_summaries_from_messages(
-    requested_ids: &[String],
-    summary_messages: Vec<GmailMessageResponse>,
-  ) -> Vec<MessageSummary> {
-    let summary_by_id = summary_messages
-      .into_iter()
-      .map(|message| (message.id.clone(), message))
-      .collect::<HashMap<_, _>>();
-
-    requested_ids
-      .iter()
-      .map(|id| {
-        if let Some(message) = summary_by_id.get(id) {
-          Self::message_summary_from_metadata_response(message)
-        } else {
-          MessageSummary {
-            id: id.clone(),
-            thread_id: None,
-            subject: None,
-            sender: None,
-            snippet: None,
-            is_read: true,
-          }
-        }
-      })
-      .collect()
   }
 
   fn sanitize_header_value(field: &str, value: &str) -> Result<String, MailError> {
@@ -539,36 +538,13 @@ impl MailAdapter for GmailAdapter {
         });
       }
 
-      let mut batch_request = client
-        .get(format!("{GMAIL_BASE_URL}/messages/batchGet"))
-        .bearer_auth(&access_token)
-        .query(&[("format", "metadata")])
-        .query(&[("metadataHeaders", "From")])
-        .query(&[("metadataHeaders", "Subject")])
-        .query(&[("metadataHeaders", "To")])
-        .query(&[(
-          "fields",
-          "messages(id,threadId,snippet,labelIds,payload/headers)",
-        )]);
-
-      for id in requested_ids.iter() {
-        batch_request = batch_request.query(&[("id", id.as_str())]);
+      let mut messages = Vec::with_capacity(requested_ids.len());
+      for message_id in requested_ids {
+        let summary =
+          Self::fetch_message_summary(client.clone(), access_token.clone(), message_id.clone())
+            .await?;
+        messages.push(summary);
       }
-
-      let batch_response = batch_request
-        .send()
-        .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-      let batch_response = Self::request_success(batch_response)?;
-      let batch_response = batch_response
-        .json::<GmailBatchGetResponse>()
-        .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-
-      let messages = Self::message_summaries_from_messages(
-        &requested_ids,
-        batch_response.messages.unwrap_or_default(),
-      );
 
       Ok(MessageList {
         messages,
@@ -739,12 +715,6 @@ struct GmailHeader {
 #[derive(Deserialize, Clone)]
 struct GmailBody {
   data: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GmailBatchGetResponse {
-  messages: Option<Vec<GmailMessageResponse>>,
 }
 
 #[derive(Serialize)]
