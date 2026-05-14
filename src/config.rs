@@ -122,14 +122,26 @@ impl Config {
     initialize_database(&connection)?;
     let transaction = connection.transaction()?;
 
-    let desired_account_ids: HashSet<String> =
-      self.accounts.iter().map(|account| account.id.clone()).collect();
-    let mut statement = transaction.prepare("select id from accounts")?;
-    let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let desired_account_ids: HashSet<String> = self
+      .accounts
+      .iter()
+      .map(|account| account.id.clone())
+      .collect();
+    let existing_account_ids = {
+      let mut statement = transaction.prepare("select id from accounts")?;
+      let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+      let mut ids = Vec::new();
+      for existing_account_id in existing_account_ids {
+        ids.push(existing_account_id?);
+      }
+      ids
+    };
     for existing_account_id in existing_account_ids {
-      let existing_account_id = existing_account_id?;
       if !desired_account_ids.contains(&existing_account_id) {
-        transaction.execute("delete from accounts where id = ?1", params![existing_account_id])?;
+        transaction.execute(
+          "delete from accounts where id = ?1",
+          params![existing_account_id],
+        )?;
       }
     }
 
