@@ -122,14 +122,28 @@ impl Config {
     initialize_database(&connection)?;
     let transaction = connection.transaction()?;
 
-    transaction.execute("delete from account_permissions", [])?;
-    transaction.execute("delete from accounts", [])?;
+    let desired_account_ids: HashSet<String> =
+      self.accounts.iter().map(|account| account.id.clone()).collect();
+    let mut statement = transaction.prepare("select id from accounts")?;
+    let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for existing_account_id in existing_account_ids {
+      let existing_account_id = existing_account_id?;
+      if !desired_account_ids.contains(&existing_account_id) {
+        transaction.execute("delete from accounts where id = ?1", params![existing_account_id])?;
+      }
+    }
 
     for account in &self.accounts {
       transaction.execute(
         "insert into accounts (
                    id, email, provider, auth_kind, auth_username, auth_secret
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6)",
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6)
+                 on conflict(id) do update set
+                   email = excluded.email,
+                   provider = excluded.provider,
+                   auth_kind = excluded.auth_kind,
+                   auth_username = excluded.auth_username,
+                   auth_secret = excluded.auth_secret",
         params![
           account.id,
           account.email,
@@ -138,6 +152,11 @@ impl Config {
           account.auth.username,
           account.auth.secret,
         ],
+      )?;
+
+      transaction.execute(
+        "delete from account_permissions where account_id = ?1",
+        params![account.id],
       )?;
 
       for permission in &account.permissions {
@@ -646,5 +665,58 @@ mod tests {
       )
       .unwrap();
     assert_eq!(cache_count, 1);
+  }
+
+  #[test]
+  fn preserves_other_accounts_cache_data_during_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_cache.db");
+
+    let config = Config {
+      accounts: vec![account("work"), account("personal")],
+    };
+    config.save(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+      .execute(
+        "insert into message_metadata_cache (
+            account_id, cache_key, message_id, cached_at
+         ) values (?1, ?2, ?3, ?4)",
+        params!["work", "q-work", "work-message", 100],
+      )
+      .unwrap();
+    connection
+      .execute(
+        "insert into message_metadata_cache (
+            account_id, cache_key, message_id, cached_at
+         ) values (?1, ?2, ?3, ?4)",
+        params!["personal", "q-personal", "personal-message", 100],
+      )
+      .unwrap();
+    drop(connection);
+
+    let mut updated = config.clone();
+    updated.accounts[0].email = "work-updated@example.com".to_string();
+    updated.save(&path).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let work_cache_count: i64 = connection
+      .query_row(
+        "select count(*) from message_metadata_cache where account_id = ?1",
+        ["work"],
+        |row| row.get(0),
+      )
+      .unwrap();
+    let personal_cache_count: i64 = connection
+      .query_row(
+        "select count(*) from message_metadata_cache where account_id = ?1",
+        ["personal"],
+        |row| row.get(0),
+      )
+      .unwrap();
+
+    assert_eq!(work_cache_count, 1);
+    assert_eq!(personal_cache_count, 1);
   }
 }
