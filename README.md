@@ -66,7 +66,9 @@ For local testing, the account secret can be either a short-lived Gmail OAuth ac
 }
 ```
 
-Store that JSON only through the CLI or TUI prompt so it lands in the local SQLite database. If `token_uri` is present, it must be `https://oauth2.googleapis.com/token`; custom token endpoints are rejected so refresh credentials are not sent to non-Google hosts. Do not paste real tokens into chat, README examples, Linear, GitHub, logs, or tracked files.
+`expires_at_unix` is optional. When a bundle includes `access_token` but omits `expires_at_unix`, McpMailBridge treats the cached access token as stale and refreshes immediately with the refresh token. When `expires_at_unix` is present, the cached access token is used only if it remains valid for more than the 60-second refresh safety window.
+
+Store that JSON only through the CLI or TUI prompt so it lands in the local SQLite database. If `token_uri` is present, it must be `https://oauth2.googleapis.com/token`; custom token endpoints are rejected before refresh credentials are used so they are not sent to non-Google hosts. Do not paste real tokens into chat, README examples, Linear, GitHub, logs, or tracked files.
 
 `Account id` is a local alias used by CLI commands and MCP requests. It is not the account email address. Use a short stable value such as `work`, `personal`, or `gmail-main`.
 

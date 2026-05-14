@@ -226,10 +226,12 @@ fn prompt_secret(provider: Provider, auth_kind: AuthKind, email: &str) -> Result
 
   match mode {
     GmailOAuthMode::DeviceLogin => run_gmail_device_login(email),
-    GmailOAuthMode::PasteSecret => Password::new("OAuth access token or token bundle JSON")
-      .without_confirmation()
-      .prompt()
-      .map_err(Into::into),
+    GmailOAuthMode::PasteSecret => Password::new(
+      "OAuth access token or token bundle JSON; bundles without expires_at_unix refresh immediately",
+    )
+    .without_confirmation()
+    .prompt()
+    .map_err(Into::into),
   }
 }
 
