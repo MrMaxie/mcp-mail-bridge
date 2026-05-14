@@ -1,3 +1,5 @@
+use chrono::TimeZone;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -77,15 +79,26 @@ impl MessageDateWindow {
     since_epoch.as_secs() as i64
   }
 
-  pub fn as_gmail_terms(&self) -> Vec<String> {
+  pub fn as_gmail_terms(&self) -> Result<Vec<String>, MailError> {
     let mut terms = Vec::new();
     if let Some(start) = self.start_unix {
-      terms.push(format!("after:{start}"));
+      terms.push(format!("after:{}", Self::unix_to_gmail_date(start)?));
     }
     if let Some(end) = self.end_unix {
-      terms.push(format!("before:{end}"));
+      terms.push(format!("before:{}", Self::unix_to_gmail_date(end)?));
     }
-    terms
+    Ok(terms)
+  }
+
+  fn unix_to_gmail_date(unix: i64) -> Result<String, MailError> {
+    Ok(
+      chrono::Utc
+        .timestamp_opt(unix, 0)
+        .single()
+        .ok_or_else(|| MailError::InvalidRequest("invalid unix timestamp".to_owned()))?
+        .format("%Y/%m/%d")
+        .to_string(),
+    )
   }
 
   pub fn validate(&self) -> Result<(), MailError> {
@@ -250,7 +263,7 @@ impl GmailAdapter {
       .collect::<Vec<_>>();
     if let Some(window) = &request.window {
       window.validate()?;
-      terms.extend(window.as_gmail_terms());
+      terms.extend(window.as_gmail_terms()?);
     }
     terms.retain(|term| !term.is_empty());
     Ok(terms.join(" "))
@@ -268,9 +281,7 @@ impl GmailAdapter {
       })
   }
 
-  fn headers_to_text(
-    headers: Option<Vec<GmailHeader>>,
-  ) -> std::collections::HashMap<String, String> {
+  fn headers_to_text(headers: Option<Vec<GmailHeader>>) -> HashMap<String, String> {
     headers
       .unwrap_or_default()
       .into_iter()
@@ -294,6 +305,123 @@ impl GmailAdapter {
           .body
           .and_then(|body| Self::decode_message_body(body.data))
       })
+  }
+
+  fn message_summary_from_metadata_response(message: &GmailMessageResponse) -> MessageSummary {
+    let headers = Self::headers_to_text(
+      message
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.headers.clone()),
+    );
+    MessageSummary {
+      id: message.id.clone(),
+      thread_id: message.thread_id.clone(),
+      subject: headers.get("subject").cloned(),
+      sender: headers.get("from").cloned(),
+      snippet: message.snippet.clone(),
+      is_read: message
+        .label_ids
+        .as_ref()
+        .map(|labels| !labels.iter().any(|label| label == "UNREAD"))
+        .unwrap_or(true),
+    }
+  }
+
+  fn message_content_from_response(message: GmailMessageResponse) -> MessageContent {
+    let payload = message.payload.clone();
+    let headers =
+      Self::headers_to_text(payload.as_ref().and_then(|payload| payload.headers.clone()));
+
+    MessageContent {
+      id: message.id,
+      thread_id: message.thread_id,
+      subject: headers.get("subject").cloned(),
+      sender: headers.get("from").cloned(),
+      recipients: headers
+        .into_iter()
+        .filter_map(|(name, value)| match name.as_str() {
+          "to" | "cc" => Some(value),
+          _ => None,
+        })
+        .collect(),
+      snippet: message.snippet,
+      body: Self::find_text_plain_body(payload),
+      is_read: message
+        .label_ids
+        .into_iter()
+        .flatten()
+        .find(|label| label == "UNREAD")
+        .is_none(),
+    }
+  }
+
+  fn sanitize_header_value(field: &str, value: &str) -> Result<String, MailError> {
+    let sanitized = value.trim();
+    if sanitized.is_empty() {
+      return Err(MailError::InvalidRequest(format!(
+        "{field} cannot be empty"
+      )));
+    }
+
+    if sanitized.contains('\r') || sanitized.contains('\n') {
+      return Err(MailError::InvalidRequest(format!(
+        "{field} contains invalid line breaks"
+      )));
+    }
+
+    if sanitized.contains('\x00') || sanitized.chars().any(|c| c.is_control()) {
+      return Err(MailError::InvalidRequest(format!(
+        "{field} contains invalid control characters"
+      )));
+    }
+
+    Ok(sanitized.to_owned())
+  }
+
+  fn validate_recipient(address: &str) -> Result<(), MailError> {
+    let mut parts = address.split('@');
+    let local_part = parts.next().filter(|part| !part.is_empty());
+    let domain_part = parts.next().filter(|part| !part.is_empty());
+    if local_part.is_none()
+      || domain_part.is_none()
+      || parts.next().is_some()
+      || domain_part.unwrap_or_default().find('.').is_none()
+    {
+      return Err(MailError::InvalidRequest(format!(
+        "to address '{address}' is not valid"
+      )));
+    }
+
+    Ok(())
+  }
+
+  fn sanitize_recipient_list(input: &str) -> Result<String, MailError> {
+    let recipients = input
+      .split(',')
+      .map(|entry| entry.trim())
+      .filter(|entry| !entry.is_empty())
+      .collect::<Vec<_>>();
+    if recipients.is_empty() {
+      return Err(MailError::InvalidRequest(
+        "to address cannot be empty".to_owned(),
+      ));
+    }
+
+    let recipients = recipients
+      .into_iter()
+      .map(|entry| {
+        let sanitized = Self::sanitize_header_value("to", entry)?;
+        Self::validate_recipient(&sanitized)?;
+        Ok::<String, MailError>(sanitized)
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(recipients.join(", "))
+  }
+
+  fn sanitize_message_body(body: &str) -> String {
+    body.replace("\r\n", "\n")
   }
 }
 
@@ -348,10 +476,24 @@ impl MailAdapter for GmailAdapter {
       .unwrap_or_default()
       .into_iter()
       .map(|entry| {
-        let message = self.read_message(&ReadMessageRequest {
-          message_id: entry.id,
-        })?;
-        Ok(message_to_summary(message))
+        let response = self
+          .client()
+          .get(format!("{GMAIL_BASE_URL}/messages/{}", entry.id))
+          .bearer_auth(&self.access_token)
+          .query(&[
+            ("format", "metadata"),
+            ("metadataHeaders", "From"),
+            ("metadataHeaders", "Subject"),
+            ("fields", "id,threadId,snippet,labelIds,payload/headers"),
+          ])
+          .send()
+          .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        let response = Self::request_success(response)?;
+        let response = response
+          .json::<GmailMessageResponse>()
+          .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+        Ok(Self::message_summary_from_metadata_response(&response))
       })
       .collect::<Result<Vec<_>, MailError>>()?;
 
@@ -386,51 +528,23 @@ impl MailAdapter for GmailAdapter {
       .json::<GmailMessageResponse>()
       .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-    let payload = response.payload.clone();
-    let headers =
-      Self::headers_to_text(payload.as_ref().and_then(|payload| payload.headers.clone()));
-
-    let is_read = response
-      .label_ids
-      .unwrap_or_default()
-      .into_iter()
-      .find(|label| label == "UNREAD")
-      .is_none();
-
-    Ok(MessageContent {
-      id: response.id,
-      thread_id: response.thread_id,
-      subject: headers.get("subject").cloned(),
-      sender: headers.get("from").cloned(),
-      recipients: headers
-        .into_iter()
-        .filter_map(|(name, value)| match name.as_str() {
-          "to" | "cc" => Some(value),
-          _ => None,
-        })
-        .collect(),
-      snippet: response.snippet,
-      body: Self::find_text_plain_body(payload),
-      is_read,
-    })
+    Ok(Self::message_content_from_response(response))
   }
 
   fn send_message(&self, request: &SendMessageRequest) -> Result<SendMessageResult, MailError> {
-    if request.to.trim().is_empty() {
-      return Err(MailError::InvalidRequest(
-        "to address cannot be empty".to_owned(),
-      ));
-    }
-    if request.subject.trim().is_empty() {
-      return Err(MailError::InvalidRequest(
-        "subject cannot be empty".to_owned(),
-      ));
-    }
-
-    let from_address = self.from_address.clone().unwrap_or_else(|| "me".to_owned());
+    let to = Self::sanitize_recipient_list(&request.to)?;
+    let subject = Self::sanitize_header_value("subject", &request.subject)?;
+    let from_address = self
+      .from_address
+      .as_deref()
+      .map(|value| Self::sanitize_header_value("from", value))
+      .transpose()?
+      .unwrap_or_else(|| "me".to_owned());
+    let body = Self::sanitize_message_body(&request.body);
     let raw_message = format!(
-      "From: {from_address}\r\nTo: {}\r\nSubject: {}\r\n\r\n{}",
-      request.to, request.subject, request.body
+      "From: {from_address}\r\nTo: {to}\r\nSubject: {subject}\r\n\
+MIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\
+Content-Transfer-Encoding: 8bit\r\n\r\n{body}"
     );
     let payload = SendRequestBody {
       raw: URL_SAFE_NO_PAD.encode(raw_message.as_bytes()),
@@ -540,17 +654,6 @@ struct ModifyMessageRequest {
   remove_label_ids: Vec<String>,
 }
 
-fn message_to_summary(message: MessageContent) -> MessageSummary {
-  MessageSummary {
-    id: message.id,
-    thread_id: message.thread_id,
-    subject: message.subject,
-    sender: message.sender,
-    snippet: message.snippet,
-    is_read: message.is_read,
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -566,6 +669,40 @@ mod tests {
       request.validate(),
       Err(MailError::InvalidRequest(
         "date window must not exceed ninety days".to_owned()
+      ))
+    );
+  }
+
+  #[test]
+  fn formats_gmail_date_window_terms_with_ymd_dates() {
+    use chrono::TimeZone;
+
+    let start = chrono::Utc
+      .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+      .single()
+      .expect("start date should be valid")
+      .timestamp();
+    let end = chrono::Utc
+      .with_ymd_and_hms(2026, 1, 31, 0, 0, 0)
+      .single()
+      .expect("end date should be valid")
+      .timestamp();
+    let request = MessageDateWindow::new(Some(start), Some(end));
+    assert_eq!(
+      request.as_gmail_terms().expect("window should be valid"),
+      vec![
+        "after:2026/01/01".to_owned(),
+        "before:2026/01/31".to_owned()
+      ]
+    );
+  }
+
+  #[test]
+  fn rejects_recipient_with_control_characters() {
+    assert_eq!(
+      GmailAdapter::sanitize_recipient_list("test\r\n@example.com"),
+      Err(MailError::InvalidRequest(
+        "to contains invalid line breaks".to_owned()
       ))
     );
   }
