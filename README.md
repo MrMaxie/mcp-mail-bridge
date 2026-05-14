@@ -119,6 +119,8 @@ McpMailBridge stores bounded summary windows, fetched message bodies, remote ver
 
 There is no fetch-all mailbox path. Cache entries are created from bounded list/search requests or explicit reads of one message id. Cached message bodies can be returned when metadata refresh is temporarily unavailable; a Gmail `not found` response is still reported as an error.
 
+Cached responses are used only for transient Gmail availability or transport failures. Authentication failures, identity mismatches, rejected requests, and missing messages are returned as errors instead of falling back to stale local data. Responses served from local cache use `source = "gmail-cache"` so clients can distinguish them from live Gmail responses.
+
 ## TUI Controls
 
 In the TUI account form:

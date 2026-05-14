@@ -8,7 +8,7 @@ use base64::{
   Engine as _,
   engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
 };
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, blocking::Client as BlockingClient};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,6 +21,8 @@ const MAX_WINDOW_DAYS: i64 = 90;
 const DEFAULT_WINDOW_DAYS: i64 = 30;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GMAIL_METADATA_FIELDS: &str =
+  "id,threadId,historyId,snippet,labelIds,internalDate,payload/headers";
 const SUMMARY_FETCH_CONCURRENCY: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +304,8 @@ pub enum MailError {
   NotFound,
   #[error("mail service is unavailable")]
   ServiceUnavailable,
+  #[error("mail transport failed: {0}")]
+  Transport(String),
   #[error("request failed: {0}")]
   RequestFailed(String),
 }
@@ -374,7 +378,7 @@ impl GmailCredential {
           ])
           .send()
           .await
-          .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+          .map_err(|error| MailError::Transport(error.to_string()))?;
         let response = GmailAdapter::request_success(response)?;
         let response = response
           .json::<TokenRefreshResponse>()
@@ -402,6 +406,70 @@ impl OAuthTokenBundle {
   }
 }
 
+pub(crate) fn validate_gmail_identity_blocking(
+  expected_email: &str,
+  secret: &str,
+) -> Result<(), MailError> {
+  let client = BlockingClient::builder()
+    .timeout(std::time::Duration::from_secs(15))
+    .build()
+    .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+  let access_token = gmail_access_token_blocking(&client, secret)?;
+  let response = client
+    .get(format!("{GMAIL_BASE_URL}/profile"))
+    .bearer_auth(access_token)
+    .send()
+    .map_err(|error| MailError::Transport(error.to_string()))?;
+  GmailAdapter::status_success(response.status())?;
+  let profile = response
+    .json::<GmailProfileResponse>()
+    .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+  if !profile.email_address.eq_ignore_ascii_case(expected_email) {
+    return Err(MailError::InvalidRequest(
+      "authenticated Gmail account does not match configured account email".to_owned(),
+    ));
+  }
+
+  Ok(())
+}
+
+fn gmail_access_token_blocking(client: &BlockingClient, secret: &str) -> Result<String, MailError> {
+  match GmailCredential::parse(secret)? {
+    GmailCredential::AccessToken(token) => Ok(token),
+    GmailCredential::Refreshable(bundle) => {
+      if let Some(access_token) = bundle.access_token.as_ref()
+        && let Some(expires_at) = bundle.expires_at_unix
+        && expires_at > MessageDateWindow::now_unix() + 60
+      {
+        return Ok(access_token.clone());
+      }
+
+      #[derive(Deserialize)]
+      struct TokenRefreshResponse {
+        access_token: String,
+      }
+
+      let token_uri = bundle.validated_token_uri()?;
+      let response = client
+        .post(token_uri)
+        .form(&[
+          ("grant_type", "refresh_token"),
+          ("refresh_token", bundle.refresh_token.as_str()),
+          ("client_id", bundle.client_id.as_str()),
+          ("client_secret", bundle.client_secret.as_str()),
+        ])
+        .send()
+        .map_err(|error| MailError::Transport(error.to_string()))?;
+      GmailAdapter::status_success(response.status())?;
+      let response = response
+        .json::<TokenRefreshResponse>()
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      Ok(response.access_token)
+    }
+  }
+}
+
 #[derive(Clone)]
 pub struct GmailAdapter {
   credential: GmailCredential,
@@ -411,6 +479,25 @@ pub struct GmailAdapter {
 }
 
 impl GmailAdapter {
+  fn status_success(status: StatusCode) -> Result<(), MailError> {
+    match status {
+      StatusCode::OK | StatusCode::CREATED => Ok(()),
+      StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(MailError::Authorization),
+      StatusCode::NOT_FOUND => Err(MailError::NotFound),
+      StatusCode::TOO_MANY_REQUESTS
+      | StatusCode::INTERNAL_SERVER_ERROR
+      | StatusCode::BAD_GATEWAY
+      | StatusCode::SERVICE_UNAVAILABLE
+      | StatusCode::GATEWAY_TIMEOUT => Err(MailError::ServiceUnavailable),
+      status if status.is_client_error() => Err(MailError::InvalidRequest(format!(
+        "gmail request was rejected with status {status}"
+      ))),
+      status => Err(MailError::RequestFailed(format!(
+        "gmail request failed with status {status}"
+      ))),
+    }
+  }
+
   pub fn new(auth_kind: &AuthKind, expected_email: &str, secret: &str) -> Result<Self, MailError> {
     if *auth_kind != AuthKind::OAuthToken {
       return Err(MailError::UnsupportedAuthKind(auth_kind.to_string()));
@@ -428,15 +515,8 @@ impl GmailAdapter {
   }
 
   fn request_success(response: Response) -> Result<Response, MailError> {
-    match response.status() {
-      StatusCode::OK | StatusCode::CREATED => Ok(response),
-      StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(MailError::Authorization),
-      StatusCode::NOT_FOUND => Err(MailError::NotFound),
-      StatusCode::SERVICE_UNAVAILABLE => Err(MailError::ServiceUnavailable),
-      status => Err(MailError::RequestFailed(format!(
-        "gmail request failed with status {status}"
-      ))),
-    }
+    Self::status_success(response.status())?;
+    Ok(response)
   }
 
   fn message_query(&self, request: &ListMessagesRequest) -> Result<String, MailError> {
@@ -610,14 +690,11 @@ impl GmailAdapter {
         ("metadataHeaders", "Subject"),
         ("metadataHeaders", "To"),
         ("metadataHeaders", "Cc"),
-        (
-          "fields",
-          "id,threadId,snippet,labelIds,internalDate,payload/headers",
-        ),
+        ("fields", GMAIL_METADATA_FIELDS),
       ])
       .send()
       .await
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      .map_err(|error| MailError::Transport(error.to_string()))?;
     let response = Self::request_success(response)?;
     let response = response
       .json::<GmailMessageResponse>()
@@ -793,7 +870,7 @@ impl MailAdapter for GmailAdapter {
         .bearer_auth(&access_token)
         .send()
         .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        .map_err(|error| MailError::Transport(error.to_string()))?;
 
       let response = Self::request_success(response)?;
       let profile = response
@@ -853,7 +930,7 @@ impl MailAdapter for GmailAdapter {
       let response = list_request
         .send()
         .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        .map_err(|error| MailError::Transport(error.to_string()))?;
       let response = Self::request_success(response)?;
       let response = response
         .json::<GmailMessageListResponse>()
@@ -934,7 +1011,7 @@ impl MailAdapter for GmailAdapter {
         ])
         .send()
         .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        .map_err(|error| MailError::Transport(error.to_string()))?;
       let response = Self::request_success(response)?;
       let response = response
         .json::<GmailMessageResponse>()
@@ -1006,7 +1083,7 @@ Content-Transfer-Encoding: 8bit\r\n\r\n{body}"
         .json(&payload)
         .send()
         .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        .map_err(|error| MailError::Transport(error.to_string()))?;
       let response = Self::request_success(response)?;
       let response = response
         .json::<GmailSendMessageResponse>()
@@ -1050,7 +1127,7 @@ Content-Transfer-Encoding: 8bit\r\n\r\n{body}"
         .json(&payload)
         .send()
         .await
-        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+        .map_err(|error| MailError::Transport(error.to_string()))?;
 
       Self::request_success(response).map(|_| StateMutationResult {
         message_id,
@@ -1348,5 +1425,24 @@ mod tests {
       "Label_123"
     );
     assert!(GmailAdapter::sanitize_query_atom("label", "bad label").is_err());
+  }
+
+  #[test]
+  fn gmail_metadata_fields_include_remote_version_marker() {
+    assert!(GMAIL_METADATA_FIELDS.contains("historyId"));
+  }
+
+  #[test]
+  fn gmail_status_mapping_keeps_client_errors_non_cacheable() {
+    assert_eq!(
+      GmailAdapter::status_success(StatusCode::BAD_REQUEST),
+      Err(MailError::InvalidRequest(
+        "gmail request was rejected with status 400 Bad Request".to_owned()
+      ))
+    );
+    assert_eq!(
+      GmailAdapter::status_success(StatusCode::BAD_GATEWAY),
+      Err(MailError::ServiceUnavailable)
+    );
   }
 }

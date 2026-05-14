@@ -12,11 +12,11 @@ use reqwest::{StatusCode, blocking::Client};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AccountConfig, AuthConfig, AuthKind, Config, Provider};
+use crate::mail;
 use crate::permissions::Permission;
 
 const GMAIL_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
 const GMAIL_SCOPE: &str =
   "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
 
@@ -146,7 +146,7 @@ pub fn prompt_account(existing: Option<AccountConfig>) -> Result<AccountConfig> 
     .prompt()?;
   let secret = prompt_secret(provider, auth_kind, &email)?;
   if provider == Provider::Gmail && auth_kind == AuthKind::OAuthToken {
-    validate_gmail_identity(&email, &secret)?;
+    mail::validate_gmail_identity_blocking(&email, &secret)?;
   }
   let permissions = MultiSelect::new("Permissions", Permission::variants()).prompt()?;
 
@@ -208,12 +208,6 @@ struct OAuthTokenBundle {
   client_secret: String,
   token_uri: Option<String>,
   expires_at_unix: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GmailProfileResponse {
-  email_address: String,
 }
 
 fn prompt_secret(provider: Provider, auth_kind: AuthKind, email: &str) -> Result<String> {
@@ -310,62 +304,6 @@ fn run_gmail_device_login(_email: &str) -> Result<String> {
       None => anyhow::bail!("Gmail OAuth failed with HTTP status {status}"),
     }
   }
-}
-
-fn validate_gmail_identity(expected_email: &str, secret: &str) -> Result<()> {
-  let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-  let access_token = gmail_access_token(&client, secret)?;
-  let profile = client
-    .get(GMAIL_PROFILE_URL)
-    .bearer_auth(access_token)
-    .send()?
-    .error_for_status()?
-    .json::<GmailProfileResponse>()?;
-
-  if !profile.email_address.eq_ignore_ascii_case(expected_email) {
-    anyhow::bail!("authenticated Gmail account does not match configured account email");
-  }
-
-  Ok(())
-}
-
-fn gmail_access_token(client: &Client, secret: &str) -> Result<String> {
-  let trimmed = secret.trim();
-  if trimmed.is_empty() {
-    anyhow::bail!("Gmail OAuth token cannot be empty");
-  }
-  if !trimmed.starts_with('{') {
-    return Ok(trimmed.to_owned());
-  }
-
-  let bundle = serde_json::from_str::<OAuthTokenBundle>(trimmed)?;
-  if let Some(access_token) = bundle.access_token.as_ref()
-    && bundle
-      .expires_at_unix
-      .map(|expires_at| expires_at > unix_timestamp() + 60)
-      .unwrap_or(true)
-  {
-    return Ok(access_token.clone());
-  }
-
-  let token_uri = bundle.token_uri.as_deref().unwrap_or(GMAIL_TOKEN_URL);
-  if token_uri != GMAIL_TOKEN_URL {
-    anyhow::bail!("oauth token bundle token_uri must be https://oauth2.googleapis.com/token");
-  }
-
-  let response = client
-    .post(token_uri)
-    .form(&[
-      ("grant_type", "refresh_token"),
-      ("refresh_token", bundle.refresh_token.as_str()),
-      ("client_id", bundle.client_id.as_str()),
-      ("client_secret", bundle.client_secret.as_str()),
-    ])
-    .send()?
-    .error_for_status()?
-    .json::<DeviceTokenResponse>()?;
-
-  Ok(response.access_token)
 }
 
 fn unix_timestamp() -> i64 {

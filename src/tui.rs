@@ -12,6 +12,7 @@ use ratatui::{
 
 use crate::{
   config::{AccountConfig, AuthConfig, AuthKind, Config, Provider},
+  mail,
   permissions::Permission,
 };
 
@@ -114,6 +115,10 @@ impl App {
     let original_id = form.original_id.clone();
     let account = form.into_account();
     let id = account.id.clone();
+
+    if account.provider == Provider::Gmail && account.auth.kind == AuthKind::OAuthToken {
+      mail::validate_gmail_identity_blocking(&account.email, &account.auth.secret)?;
+    }
 
     if let Some(original_id) = original_id
       && original_id != id

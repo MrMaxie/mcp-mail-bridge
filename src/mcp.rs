@@ -96,12 +96,9 @@ impl MailBridgeServer {
 
   async fn adapter_for_account(
     account: &AccountConfig,
-  ) -> Result<Box<dyn mail::MailAdapter>, String> {
-    let adapter = mail::adapter_for(account).map_err(|error| error.to_string())?;
-    adapter
-      .validate_account()
-      .await
-      .map_err(|error| error.to_string())?;
+  ) -> Result<Box<dyn mail::MailAdapter>, mail::MailError> {
+    let adapter = mail::adapter_for(account)?;
+    adapter.validate_account().await?;
     Ok(adapter)
   }
 
@@ -111,7 +108,9 @@ impl MailBridgeServer {
     permission: Permission,
   ) -> Result<Box<dyn mail::MailAdapter>, String> {
     let account = self.account_for_request(account_id, permission)?;
-    Self::adapter_for_account(&account).await
+    Self::adapter_for_account(&account)
+      .await
+      .map_err(|error| error.to_string())
   }
 
   fn serialize_response<T: Serialize>(value: &T) -> String {
@@ -186,6 +185,49 @@ impl MailBridgeServer {
     }
   }
 
+  fn cached_message_list_response(&self, account_id: &str, cache_key: &str) -> Option<String> {
+    config::load_cached_message_summaries(&self.database_path, account_id, cache_key)
+      .ok()
+      .flatten()
+      .map(|cached| {
+        Self::serialize_response(&mail::MessageList {
+          messages: cached
+            .messages
+            .into_iter()
+            .map(Self::cached_summary_to_mail)
+            .collect(),
+          next_page_token: cached.next_page_token,
+        })
+      })
+  }
+
+  fn cached_message_or_error(
+    &self,
+    account_id: &str,
+    cache_key: &str,
+    error: mail::MailError,
+  ) -> String {
+    if Self::can_use_cache_after_mail_error(&error)
+      && let Some(response) = self.cached_message_list_response(account_id, cache_key)
+    {
+      return response;
+    }
+
+    json!({ "error": error.to_string() }).to_string()
+  }
+
+  fn can_use_cache_after_mail_error(error: &mail::MailError) -> bool {
+    matches!(
+      error,
+      mail::MailError::ServiceUnavailable | mail::MailError::Transport(_)
+    )
+  }
+
+  fn cached_message_content_response(mut message: mail::MessageContent) -> String {
+    message.source = "gmail-cache".to_owned();
+    Self::serialize_response(&message)
+  }
+
   fn refresh_cached_message_content(
     mut content: mail::MessageContent,
     summary: &mail::MessageSummary,
@@ -198,7 +240,7 @@ impl MailBridgeServer {
     content.received_at = summary.received_at;
     content.is_read = summary.is_read;
     content.labels = summary.labels.clone();
-    content.source = summary.source.clone();
+    content.source = "gmail-cache".to_owned();
     content
   }
 
@@ -338,12 +380,15 @@ impl MailBridgeServer {
       request.page_token.as_deref(),
     );
 
-    let adapter = match self
-      .adapter_for_request(&request.account_id, Permission::Search)
-      .await
-    {
-      Ok(adapter) => adapter,
+    let account = match self.account_for_request(&request.account_id, Permission::Search) {
+      Ok(account) => account,
       Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let adapter = match Self::adapter_for_account(&account).await {
+      Ok(adapter) => adapter,
+      Err(error) => {
+        return self.cached_message_or_error(&request.account_id, &cache_key, error);
+      }
     };
 
     match adapter
@@ -383,21 +428,7 @@ impl MailBridgeServer {
         }
         Self::serialize_response(&message_list)
       }
-      Err(error) => match config::load_cached_message_summaries(
-        &self.database_path,
-        &request.account_id,
-        &cache_key,
-      ) {
-        Ok(Some(cached)) => Self::serialize_response(&mail::MessageList {
-          messages: cached
-            .messages
-            .into_iter()
-            .map(Self::cached_summary_to_mail)
-            .collect(),
-          next_page_token: cached.next_page_token,
-        }),
-        Ok(None) | Err(_) => json!({ "error": error.to_string() }).to_string(),
-      },
+      Err(error) => self.cached_message_or_error(&request.account_id, &cache_key, error),
     }
   }
 
@@ -407,51 +438,61 @@ impl MailBridgeServer {
       Ok(account) => account,
       Err(error) => return json!({ "error": error }).to_string(),
     };
-    let adapter = match Self::adapter_for_account(&account).await {
-      Ok(adapter) => adapter,
-      Err(error) => return json!({ "error": error }).to_string(),
-    };
-
-    match config::load_cached_message_body(
+    let cached_message = match config::load_cached_message_body(
       &self.database_path,
       &request.account_id,
       &request.message_id,
     ) {
-      Ok(Some(body_json)) => {
-        if let Ok(mut message) = serde_json::from_str::<mail::MessageContent>(&body_json) {
-          match adapter
-            .refresh_message_summaries(vec![request.message_id.clone()])
-            .await
-          {
-            Ok(mut summaries) => {
-              if let Some(summary) = summaries.pop() {
-                message = Self::refresh_cached_message_content(message, &summary);
-              }
-            }
-            Err(mail::MailError::NotFound) => {
-              return json!({ "error": mail::MailError::NotFound.to_string() }).to_string();
-            }
-            Err(_) => return Self::serialize_response(&message),
-          }
-
-          let body_json = match serde_json::to_string(&message) {
-            Ok(body_json) => body_json,
-            Err(error) => return json!({ "error": error.to_string() }).to_string(),
-          };
-          if let Err(error) = config::save_cached_message_body(
-            &self.database_path,
-            &request.account_id,
-            None,
-            &message.id,
-            &body_json,
-          ) {
-            return json!({ "error": error.to_string() }).to_string();
-          }
-          return Self::serialize_response(&message);
-        }
-      }
-      Ok(None) => {}
+      Ok(Some(body_json)) => serde_json::from_str::<mail::MessageContent>(&body_json).ok(),
+      Ok(None) => None,
       Err(error) => return json!({ "error": error.to_string() }).to_string(),
+    };
+
+    let adapter = match Self::adapter_for_account(&account).await {
+      Ok(adapter) => adapter,
+      Err(error) => {
+        if Self::can_use_cache_after_mail_error(&error)
+          && let Some(message) = cached_message
+        {
+          return Self::cached_message_content_response(message);
+        }
+        return json!({ "error": error.to_string() }).to_string();
+      }
+    };
+
+    if let Some(mut message) = cached_message {
+      match adapter
+        .refresh_message_summaries(vec![request.message_id.clone()])
+        .await
+      {
+        Ok(mut summaries) => {
+          if let Some(summary) = summaries.pop() {
+            message = Self::refresh_cached_message_content(message, &summary);
+          }
+        }
+        Err(mail::MailError::NotFound) => {
+          return json!({ "error": mail::MailError::NotFound.to_string() }).to_string();
+        }
+        Err(error) if Self::can_use_cache_after_mail_error(&error) => {
+          return Self::cached_message_content_response(message);
+        }
+        Err(error) => return json!({ "error": error.to_string() }).to_string(),
+      }
+
+      let body_json = match serde_json::to_string(&message) {
+        Ok(body_json) => body_json,
+        Err(error) => return json!({ "error": error.to_string() }).to_string(),
+      };
+      if let Err(error) = config::save_cached_message_body(
+        &self.database_path,
+        &request.account_id,
+        None,
+        &message.id,
+        &body_json,
+      ) {
+        return json!({ "error": error.to_string() }).to_string();
+      }
+      return Self::serialize_response(&message);
     }
 
     match adapter
@@ -602,6 +643,102 @@ mod tests {
   }
 
   #[test]
+  fn cached_message_list_response_returns_cached_summaries() {
+    let database = tempfile::NamedTempFile::new().expect("temp database should be created");
+    let database_path = database.path().to_path_buf();
+    let server = MailBridgeServer::new(database_path.clone());
+    Config {
+      accounts: vec![AccountConfig {
+        id: "work".to_owned(),
+        email: "work@example.com".to_owned(),
+        provider: config::Provider::Gmail,
+        permissions: vec![Permission::Search],
+        auth: config::AuthConfig {
+          kind: config::AuthKind::OAuthToken,
+          username: None,
+          secret: "token".to_owned(),
+        },
+      }],
+    }
+    .save(&database_path)
+    .expect("account should save");
+
+    config::save_cached_message_summaries(
+      &database_path,
+      "work",
+      "cache-key",
+      config::CacheWindow {
+        query: Some("from:example.com"),
+        label: Some("INBOX"),
+        from_timestamp: Some(10),
+        to_timestamp: Some(20),
+        read_state: Some("unread"),
+        cursor: Some("next"),
+      },
+      &[CachedMessageSummary {
+        id: "message-1".to_owned(),
+        thread_id: Some("thread-1".to_owned()),
+        remote_version: Some("history-1".to_owned()),
+        subject: Some("Subject".to_owned()),
+        sender: Some("sender@example.com".to_owned()),
+        recipients: vec!["reader@example.com".to_owned()],
+        snippet: Some("Snippet".to_owned()),
+        received_at: Some(15),
+        is_read: false,
+        labels: vec!["INBOX".to_owned(), "UNREAD".to_owned()],
+      }],
+    )
+    .expect("cached summary should save");
+
+    let response = server
+      .cached_message_list_response("work", "cache-key")
+      .expect("cached response should load");
+
+    assert!(response.contains("\"id\": \"message-1\""));
+    assert!(response.contains("\"source\": \"gmail-cache\""));
+    assert!(response.contains("\"next_page_token\": \"next\""));
+  }
+
+  #[test]
+  fn cache_fallback_is_limited_to_transient_mail_errors() {
+    assert!(MailBridgeServer::can_use_cache_after_mail_error(
+      &mail::MailError::ServiceUnavailable
+    ));
+    assert!(MailBridgeServer::can_use_cache_after_mail_error(
+      &mail::MailError::Transport("network timeout".to_owned())
+    ));
+    assert!(!MailBridgeServer::can_use_cache_after_mail_error(
+      &mail::MailError::RequestFailed("provider rejected request".to_owned())
+    ));
+    assert!(!MailBridgeServer::can_use_cache_after_mail_error(
+      &mail::MailError::Authorization
+    ));
+    assert!(!MailBridgeServer::can_use_cache_after_mail_error(
+      &mail::MailError::InvalidRequest("identity mismatch".to_owned())
+    ));
+  }
+
+  #[test]
+  fn cached_message_content_response_marks_cache_source() {
+    let response = MailBridgeServer::cached_message_content_response(mail::MessageContent {
+      id: "message-1".to_owned(),
+      thread_id: None,
+      subject: None,
+      sender: None,
+      recipients: Vec::new(),
+      snippet: None,
+      body: Some("Cached body".to_owned()),
+      body_format: "text/plain".to_owned(),
+      received_at: Some(10),
+      is_read: true,
+      labels: Vec::new(),
+      source: "gmail".to_owned(),
+    });
+
+    assert!(response.contains("\"source\": \"gmail-cache\""));
+  }
+
+  #[test]
   fn filters_message_summaries_to_exact_requested_window() {
     let messages = vec![
       mail::MessageSummary {
@@ -687,5 +824,6 @@ mod tests {
     assert_eq!(refreshed.subject.as_deref(), Some("New subject"));
     assert!(refreshed.is_read);
     assert_eq!(refreshed.labels, vec!["INBOX"]);
+    assert_eq!(refreshed.source, "gmail-cache");
   }
 }
