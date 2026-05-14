@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use anyhow::Result;
 use rmcp::{
@@ -63,9 +65,16 @@ impl MailBridgeServer {
     Config::load_or_default(&self.database_path).map_err(|error| error.to_string())
   }
 
-  fn run_with_adapter<T, F>(&self, account_id: &str, permission: Permission, action: F) -> String
+  async fn run_with_adapter<T, F>(
+    &self,
+    account_id: &str,
+    permission: Permission,
+    action: F,
+  ) -> String
   where
-    F: FnOnce(&dyn mail::MailAdapter) -> Result<T, mail::MailError>,
+    F: for<'a> FnOnce(
+      &'a dyn mail::MailAdapter,
+    ) -> Pin<Box<dyn Future<Output = Result<T, mail::MailError>> + Send + 'a>>,
     T: Serialize,
   {
     let config = match self.load_config() {
@@ -90,11 +99,11 @@ impl MailBridgeServer {
       Err(error) => return json!({ "error": error.to_string() }).to_string(),
     };
 
-    if let Err(error) = adapter.validate_account() {
+    if let Err(error) = adapter.validate_account().await {
       return json!({ "error": error.to_string() }).to_string();
     }
 
-    match action(adapter.as_ref()) {
+    match action(adapter.as_ref()).await {
       Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|error| {
         json!({
           "error": format!("failed to serialize response: {error}")
@@ -132,7 +141,7 @@ impl MailBridgeServer {
   }
 
   #[tool(description = "List messages for an account.")]
-  fn list_messages(&self, Parameters(request): Parameters<ListMessagesRequest>) -> String {
+  async fn list_messages(&self, Parameters(request): Parameters<ListMessagesRequest>) -> String {
     if let Err(error) =
       mail::MessageDateWindow::new(request.start_unix, request.end_unix).validate()
     {
@@ -141,47 +150,67 @@ impl MailBridgeServer {
 
     let window = mail::MessageDateWindow::new(request.start_unix, request.end_unix);
 
-    self.run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
-      adapter.list_messages(&mail::ListMessagesRequest {
-        query: request.query,
-        window: Some(window),
-        limit: request.limit,
-        page_token: request.page_token,
+    self
+      .run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
+        Box::pin(async move {
+          adapter
+            .list_messages(mail::ListMessagesRequest {
+              query: request.query,
+              window: Some(window),
+              limit: request.limit,
+              page_token: request.page_token,
+            })
+            .await
+        })
       })
-    })
+      .await
   }
 
   #[tool(description = "Read one message for an account.")]
-  fn read_message(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
+  async fn read_message(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
     let message_id = request.message_id;
-    self.run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
-      adapter.read_message(&mail::ReadMessageRequest { message_id })
-    })
+    self
+      .run_with_adapter(&request.account_id, Permission::Read, move |adapter| {
+        Box::pin(async move {
+          adapter
+            .read_message(mail::ReadMessageRequest { message_id })
+            .await
+        })
+      })
+      .await
   }
 
   #[tool(description = "Send a message from an account.")]
-  fn send_message(&self, Parameters(request): Parameters<SendMessageRequest>) -> String {
+  async fn send_message(&self, Parameters(request): Parameters<SendMessageRequest>) -> String {
     let message = mail::SendMessageRequest {
       to: request.to,
       subject: request.subject,
       body: request.body,
     };
-    self.run_with_adapter(&request.account_id, Permission::Write, move |adapter| {
-      adapter.send_message(&message)
-    })
+    self
+      .run_with_adapter(&request.account_id, Permission::Write, move |adapter| {
+        Box::pin(async move { adapter.send_message(message).await })
+      })
+      .await
   }
 
   #[tool(description = "Mark a message as read for an account.")]
-  fn mark_as_read(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
+  async fn mark_as_read(&self, Parameters(request): Parameters<ReadMessageRequest>) -> String {
     let message_id = request.message_id;
-    self.run_with_adapter(
-      &request.account_id,
-      Permission::MarkAsRead,
-      move |adapter| {
-        adapter.mark_as_read(&mail::ReadMessageRequest { message_id })?;
-        Ok(json!({ "status": "message marked as read" }))
-      },
-    )
+    self
+      .run_with_adapter(
+        &request.account_id,
+        Permission::MarkAsRead,
+        move |adapter| {
+          Box::pin(async move {
+            adapter
+              .mark_as_read(mail::ReadMessageRequest { message_id })
+              .await?;
+            Ok(json!({ "status": "message marked as read" }))
+          })
+        },
+      )
+      .await
   }
 }
 

@@ -1,12 +1,11 @@
 use chrono::TimeZone;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::{
-  StatusCode,
-  blocking::{Client, Response},
-};
+use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -156,12 +155,26 @@ pub struct SendMessageRequest {
   pub body: String,
 }
 
-pub trait MailAdapter {
-  fn validate_account(&self) -> Result<ValidationResult, MailError>;
-  fn list_messages(&self, request: &ListMessagesRequest) -> Result<MessageList, MailError>;
-  fn read_message(&self, request: &ReadMessageRequest) -> Result<MessageContent, MailError>;
-  fn send_message(&self, request: &SendMessageRequest) -> Result<SendMessageResult, MailError>;
-  fn mark_as_read(&self, request: &ReadMessageRequest) -> Result<(), MailError>;
+pub trait MailAdapter: Send + Sync {
+  fn validate_account(
+    &self,
+  ) -> Pin<Box<dyn Future<Output = Result<ValidationResult, MailError>> + Send>>;
+  fn list_messages(
+    &self,
+    request: ListMessagesRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<MessageList, MailError>> + Send>>;
+  fn read_message(
+    &self,
+    request: ReadMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<MessageContent, MailError>> + Send>>;
+  fn send_message(
+    &self,
+    request: SendMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<SendMessageResult, MailError>> + Send>>;
+  fn mark_as_read(
+    &self,
+    request: ReadMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send>>;
 }
 
 pub fn adapter_for(account: &AccountConfig) -> Result<Box<dyn MailAdapter>, MailError> {
@@ -201,11 +214,11 @@ pub enum MailError {
   RequestFailed(String),
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct GmailAdapter {
   access_token: String,
   from_address: Option<String>,
-  client: Option<Client>,
+  client: Client,
 }
 
 impl GmailAdapter {
@@ -225,20 +238,11 @@ impl GmailAdapter {
     Ok(Self {
       access_token: access_token.to_owned(),
       from_address: from_address.map(ToOwned::to_owned),
-      client: Some(
-        Client::builder()
-          .timeout(std::time::Duration::from_secs(15))
-          .build()
-          .map_err(|error| MailError::RequestFailed(error.to_string()))?,
-      ),
+      client: Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?,
     })
-  }
-
-  fn client(&self) -> &Client {
-    self
-      .client
-      .as_ref()
-      .expect("gmail adapter requires a configured client")
   }
 
   fn request_success(response: Response) -> Result<Response, MailError> {
@@ -356,6 +360,34 @@ impl GmailAdapter {
     }
   }
 
+  fn message_summaries_from_messages(
+    requested_ids: &[String],
+    summary_messages: Vec<GmailMessageResponse>,
+  ) -> Vec<MessageSummary> {
+    let summary_by_id = summary_messages
+      .into_iter()
+      .map(|message| (message.id.clone(), message))
+      .collect::<HashMap<_, _>>();
+
+    requested_ids
+      .iter()
+      .map(|id| {
+        if let Some(message) = summary_by_id.get(id) {
+          Self::message_summary_from_metadata_response(message)
+        } else {
+          MessageSummary {
+            id: id.clone(),
+            thread_id: None,
+            subject: None,
+            sender: None,
+            snippet: None,
+            is_read: true,
+          }
+        }
+      })
+      .collect()
+  }
+
   fn sanitize_header_value(field: &str, value: &str) -> Result<String, MailError> {
     let sanitized = value.trim();
     if sanitized.is_empty() {
@@ -426,191 +458,261 @@ impl GmailAdapter {
 }
 
 impl MailAdapter for GmailAdapter {
-  fn validate_account(&self) -> Result<ValidationResult, MailError> {
-    let response = self
-      .client()
-      .get(format!("{GMAIL_BASE_URL}/profile"))
-      .bearer_auth(&self.access_token)
-      .send()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+  fn validate_account(
+    &self,
+  ) -> Pin<Box<dyn Future<Output = Result<ValidationResult, MailError>> + Send>> {
+    let client = self.client.clone();
+    let access_token = self.access_token.clone();
 
-    let response = Self::request_success(response)?;
-    let profile = response
-      .json::<GmailProfileResponse>()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+    Box::pin(async move {
+      let response = client
+        .get(format!("{GMAIL_BASE_URL}/profile"))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-    Ok(ValidationResult {
-      provider_account: profile.email_address,
-    })
-  }
+      let response = Self::request_success(response)?;
+      let profile = response
+        .json::<GmailProfileResponse>()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-  fn list_messages(&self, request: &ListMessagesRequest) -> Result<MessageList, MailError> {
-    let window = request.window.as_ref().cloned().unwrap_or_default();
-    window.validate()?;
-
-    let limit = enforce_request_limit(request.limit);
-    let query = self.message_query(request)?;
-    let mut request_builder = self
-      .client()
-      .get(format!("{GMAIL_BASE_URL}/messages"))
-      .bearer_auth(&self.access_token)
-      .query(&[
-        ("maxResults", limit.to_string()),
-        ("pageToken", request.page_token.clone().unwrap_or_default()),
-      ]);
-
-    if !query.trim().is_empty() {
-      request_builder = request_builder.query(&[("q", query)]);
-    }
-
-    let response = request_builder
-      .send()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-    let response = Self::request_success(response)?;
-    let response = response
-      .json::<GmailMessageListResponse>()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-
-    let messages = response
-      .messages
-      .unwrap_or_default()
-      .into_iter()
-      .map(|entry| {
-        let response = self
-          .client()
-          .get(format!("{GMAIL_BASE_URL}/messages/{}", entry.id))
-          .bearer_auth(&self.access_token)
-          .query(&[
-            ("format", "metadata"),
-            ("metadataHeaders", "From"),
-            ("metadataHeaders", "Subject"),
-            ("fields", "id,threadId,snippet,labelIds,payload/headers"),
-          ])
-          .send()
-          .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-        let response = Self::request_success(response)?;
-        let response = response
-          .json::<GmailMessageResponse>()
-          .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-
-        Ok(Self::message_summary_from_metadata_response(&response))
+      Ok(ValidationResult {
+        provider_account: profile.email_address,
       })
-      .collect::<Result<Vec<_>, MailError>>()?;
-
-    Ok(MessageList {
-      messages,
-      next_page_token: response.next_page_token,
     })
   }
 
-  fn read_message(&self, request: &ReadMessageRequest) -> Result<MessageContent, MailError> {
-    if request.message_id.trim().is_empty() {
-      return Err(MailError::InvalidRequest(
-        "message_id cannot be empty".to_owned(),
-      ));
-    }
+  fn list_messages(
+    &self,
+    request: ListMessagesRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<MessageList, MailError>> + Send>> {
+    let adapter = self.clone();
+    let client = self.client.clone();
+    let access_token = self.access_token.clone();
 
-    let response = self
-      .client()
-      .get(format!("{GMAIL_BASE_URL}/messages/{}", request.message_id))
-      .bearer_auth(&self.access_token)
-      .query(&[
-        ("format", "full".to_owned()),
-        ("metadataHeaders", "From".to_owned()),
-        ("metadataHeaders", "To".to_owned()),
-        ("metadataHeaders", "Cc".to_owned()),
-        ("metadataHeaders", "Subject".to_owned()),
-      ])
-      .send()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-    let response = Self::request_success(response)?;
-    let response = response
-      .json::<GmailMessageResponse>()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+    Box::pin(async move {
+      let window = request.window.clone().unwrap_or_default();
+      window.validate()?;
 
-    Ok(Self::message_content_from_response(response))
+      let limit = enforce_request_limit(request.limit);
+      let query = adapter.message_query(&request)?;
+      let mut list_request = client
+        .get(format!("{GMAIL_BASE_URL}/messages"))
+        .bearer_auth(&access_token)
+        .query(&[("maxResults", limit.to_string())]);
+
+      if let Some(page_token) = request
+        .page_token
+        .as_ref()
+        .filter(|token| !token.is_empty())
+      {
+        list_request = list_request.query(&[("pageToken", page_token)]);
+      }
+      if !query.trim().is_empty() {
+        list_request = list_request.query(&[("q", query.as_str())]);
+      }
+
+      let response = list_request
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let response = Self::request_success(response)?;
+      let response = response
+        .json::<GmailMessageListResponse>()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+      let requested_ids = response
+        .messages
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+
+      if requested_ids.is_empty() {
+        return Ok(MessageList {
+          messages: Vec::new(),
+          next_page_token: response.next_page_token,
+        });
+      }
+
+      let mut batch_request = client
+        .get(format!("{GMAIL_BASE_URL}/messages/batchGet"))
+        .bearer_auth(&access_token)
+        .query(&[("format", "metadata")])
+        .query(&[("metadataHeaders", "From")])
+        .query(&[("metadataHeaders", "Subject")])
+        .query(&[("metadataHeaders", "To")])
+        .query(&[(
+          "fields",
+          "messages(id,threadId,snippet,labelIds,payload/headers)",
+        )]);
+
+      for id in requested_ids.iter() {
+        batch_request = batch_request.query(&[("id", id.as_str())]);
+      }
+
+      let batch_response = batch_request
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let batch_response = Self::request_success(batch_response)?;
+      let batch_response = batch_response
+        .json::<GmailBatchGetResponse>()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+      let messages = Self::message_summaries_from_messages(
+        &requested_ids,
+        batch_response.messages.unwrap_or_default(),
+      );
+
+      Ok(MessageList {
+        messages,
+        next_page_token: response.next_page_token,
+      })
+    })
   }
 
-  fn send_message(&self, request: &SendMessageRequest) -> Result<SendMessageResult, MailError> {
-    let to = Self::sanitize_recipient_list(&request.to)?;
-    let subject = Self::sanitize_header_value("subject", &request.subject)?;
-    let from_address = self
-      .from_address
-      .as_deref()
-      .map(|value| Self::sanitize_header_value("from", value))
-      .transpose()?
-      .unwrap_or_else(|| "me".to_owned());
-    let body = Self::sanitize_message_body(&request.body);
-    let raw_message = format!(
-      "From: {from_address}\r\nTo: {to}\r\nSubject: {subject}\r\n\
+  fn read_message(
+    &self,
+    request: ReadMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<MessageContent, MailError>> + Send>> {
+    let client = self.client.clone();
+    let access_token = self.access_token.clone();
+    Box::pin(async move {
+      if request.message_id.trim().is_empty() {
+        return Err(MailError::InvalidRequest(
+          "message_id cannot be empty".to_owned(),
+        ));
+      }
+
+      let response = client
+        .get(format!("{GMAIL_BASE_URL}/messages/{}", request.message_id))
+        .bearer_auth(&access_token)
+        .query(&[
+          ("format", "full".to_owned()),
+          ("metadataHeaders", "From".to_owned()),
+          ("metadataHeaders", "To".to_owned()),
+          ("metadataHeaders", "Cc".to_owned()),
+          ("metadataHeaders", "Subject".to_owned()),
+        ])
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let response = Self::request_success(response)?;
+      let response = response
+        .json::<GmailMessageResponse>()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+      Ok(Self::message_content_from_response(response))
+    })
+  }
+
+  fn send_message(
+    &self,
+    request: SendMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<SendMessageResult, MailError>> + Send>> {
+    let client = self.client.clone();
+    let access_token = self.access_token.clone();
+    let from_address = self.from_address.clone();
+    Box::pin(async move {
+      let to = Self::sanitize_recipient_list(&request.to)?;
+      let subject = Self::sanitize_header_value("subject", &request.subject)?;
+      let from_address = from_address
+        .as_deref()
+        .map(|value| Self::sanitize_header_value("from", value))
+        .transpose()?
+        .unwrap_or_else(|| "me".to_owned());
+      let body = Self::sanitize_message_body(&request.body);
+      let raw_message = format!(
+        "From: {from_address}\r\nTo: {to}\r\nSubject: {subject}\r\n\
 MIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"UTF-8\"\r\n\
 Content-Transfer-Encoding: 8bit\r\n\r\n{body}"
-    );
-    let payload = SendRequestBody {
-      raw: URL_SAFE_NO_PAD.encode(raw_message.as_bytes()),
-    };
+      );
+      let payload = SendRequestBody {
+        raw: URL_SAFE_NO_PAD.encode(raw_message.as_bytes()),
+      };
 
-    let response = self
-      .client()
-      .post(format!("{GMAIL_BASE_URL}/messages/send"))
-      .bearer_auth(&self.access_token)
-      .json(&payload)
-      .send()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
-    let response = Self::request_success(response)?;
-    let response = response
-      .json::<GmailSendMessageResponse>()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let response = client
+        .post(format!("{GMAIL_BASE_URL}/messages/send"))
+        .bearer_auth(&access_token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let response = Self::request_success(response)?;
+      let response = response
+        .json::<GmailSendMessageResponse>()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-    Ok(SendMessageResult {
-      message_id: response.id,
-      thread_id: response.thread_id,
+      Ok(SendMessageResult {
+        message_id: response.id,
+        thread_id: response.thread_id,
+      })
     })
   }
 
-  fn mark_as_read(&self, request: &ReadMessageRequest) -> Result<(), MailError> {
-    if request.message_id.trim().is_empty() {
-      return Err(MailError::InvalidRequest(
-        "message_id cannot be empty".to_owned(),
-      ));
-    }
+  fn mark_as_read(
+    &self,
+    request: ReadMessageRequest,
+  ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send>> {
+    let client = self.client.clone();
+    let access_token = self.access_token.clone();
 
-    let payload = ModifyMessageRequest {
-      remove_label_ids: vec!["UNREAD".to_owned()],
-    };
+    Box::pin(async move {
+      if request.message_id.trim().is_empty() {
+        return Err(MailError::InvalidRequest(
+          "message_id cannot be empty".to_owned(),
+        ));
+      }
 
-    let response = self
-      .client()
-      .post(format!(
-        "{GMAIL_BASE_URL}/messages/{}/modify",
-        request.message_id
-      ))
-      .bearer_auth(&self.access_token)
-      .json(&payload)
-      .send()
-      .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+      let payload = ModifyMessageRequest {
+        remove_label_ids: vec!["UNREAD".to_owned()],
+      };
 
-    Self::request_success(response).map(|_| ())
+      let response = client
+        .post(format!(
+          "{GMAIL_BASE_URL}/messages/{}/modify",
+          request.message_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| MailError::RequestFailed(error.to_string()))?;
+
+      Self::request_success(response).map(|_| ())
+    })
   }
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GmailProfileResponse {
   email_address: String,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GmailMessageListResponse {
   messages: Option<Vec<GmailListMessage>>,
   next_page_token: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GmailListMessage {
   id: String,
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GmailMessageResponse {
   id: String,
   thread_id: Option<String>,
@@ -620,6 +722,7 @@ struct GmailMessageResponse {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GmailMessagePayload {
   headers: Option<Vec<GmailHeader>>,
   body: Option<GmailBody>,
@@ -636,6 +739,12 @@ struct GmailHeader {
 #[derive(Deserialize, Clone)]
 struct GmailBody {
   data: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GmailBatchGetResponse {
+  messages: Option<Vec<GmailMessageResponse>>,
 }
 
 #[derive(Serialize)]
