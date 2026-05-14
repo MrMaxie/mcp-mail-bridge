@@ -32,6 +32,26 @@ pub struct AuthConfig {
   pub secret: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedMessageSummary {
+  pub id: String,
+  pub thread_id: Option<String>,
+  pub remote_version: Option<String>,
+  pub subject: Option<String>,
+  pub sender: Option<String>,
+  pub recipients: Vec<String>,
+  pub snippet: Option<String>,
+  pub received_at: Option<i64>,
+  pub is_read: bool,
+  pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedMessageList {
+  pub messages: Vec<CachedMessageSummary>,
+  pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Provider {
   ImapSmtp,
@@ -66,9 +86,11 @@ pub enum ConfigError {
   UnknownAuthKind(String),
   #[error("unknown permission '{0}'")]
   UnknownPermission(String),
+  #[error("gmail account '{0}' must use oauth_token auth")]
+  GmailRequiresOAuthToken(String),
 }
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 impl Config {
   pub fn load_or_default(path: &Path) -> Result<Self> {
@@ -122,18 +144,56 @@ impl Config {
     initialize_database(&connection)?;
     let transaction = connection.transaction()?;
 
-    let desired_account_ids: HashSet<String> =
-      self.accounts.iter().map(|account| account.id.clone()).collect();
-    let mut statement = transaction.prepare("select id from accounts")?;
-    let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let desired_account_ids: HashSet<String> = self
+      .accounts
+      .iter()
+      .map(|account| account.id.clone())
+      .collect();
+    let existing_account_ids = {
+      let mut statement = transaction.prepare("select id from accounts")?;
+      let existing_account_ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+      let mut ids = Vec::new();
+      for existing_account_id in existing_account_ids {
+        ids.push(existing_account_id?);
+      }
+      ids
+    };
     for existing_account_id in existing_account_ids {
-      let existing_account_id = existing_account_id?;
       if !desired_account_ids.contains(&existing_account_id) {
-        transaction.execute("delete from accounts where id = ?1", params![existing_account_id])?;
+        transaction.execute(
+          "delete from accounts where id = ?1",
+          params![existing_account_id],
+        )?;
       }
     }
 
     for account in &self.accounts {
+      let existing_identity = transaction
+        .query_row(
+          "select email, provider, auth_kind, auth_username, auth_secret
+           from accounts where id = ?1",
+          params![account.id],
+          |row| {
+            Ok((
+              row.get::<_, String>(0)?,
+              row.get::<_, String>(1)?,
+              row.get::<_, String>(2)?,
+              row.get::<_, Option<String>>(3)?,
+              row.get::<_, String>(4)?,
+            ))
+          },
+        )
+        .optional()?;
+      if let Some((email, provider, auth_kind, username, secret)) = existing_identity
+        && (email != account.email
+          || provider != account.provider.to_string()
+          || auth_kind != account.auth.kind.to_string()
+          || username != account.auth.username
+          || secret != account.auth.secret)
+      {
+        delete_cached_account_data(&transaction, &account.id)?;
+      }
+
       transaction.execute(
         "insert into accounts (
                    id, email, provider, auth_kind, auth_username, auth_secret
@@ -188,6 +248,9 @@ impl Config {
       if account.auth.secret.trim().is_empty() {
         return Err(ConfigError::EmptySecret(account.id.clone()));
       }
+      if account.provider == Provider::Gmail && account.auth.kind != AuthKind::OAuthToken {
+        return Err(ConfigError::GmailRequiresOAuthToken(account.id.clone()));
+      }
       if account.permissions.is_empty() {
         return Err(ConfigError::MissingPermissions(account.id.clone()));
       }
@@ -229,6 +292,7 @@ impl Config {
 impl AccountConfig {
   pub fn allows(&self, permission: Permission) -> bool {
     self.permissions.contains(&permission)
+      || (permission == Permission::Search && self.permissions.contains(&Permission::Read))
   }
 
   pub fn permission_list(&self) -> String {
@@ -239,6 +303,295 @@ impl AccountConfig {
       .collect::<Vec<_>>()
       .join(",")
   }
+}
+
+pub struct CacheWindow<'a> {
+  pub query: Option<&'a str>,
+  pub label: Option<&'a str>,
+  pub from_timestamp: Option<i64>,
+  pub to_timestamp: Option<i64>,
+  pub read_state: Option<&'a str>,
+  pub cursor: Option<&'a str>,
+}
+
+pub fn load_cached_message_summaries(
+  path: &Path,
+  account_id: &str,
+  cache_key: &str,
+) -> Result<Option<CachedMessageList>> {
+  let connection = open_database(path)?;
+  initialize_database(&connection)?;
+  let next_page_token = connection
+    .query_row(
+      "select cursor from cache_windows where account_id = ?1 and cache_key = ?2",
+      params![account_id, cache_key],
+      |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()?;
+
+  let Some(next_page_token) = next_page_token else {
+    return Ok(None);
+  };
+
+  let mut statement = connection.prepare(
+    "select message_id, thread_id, remote_version, subject, sender, recipients, snippet,
+            received_at, is_read, labels
+       from message_metadata_cache
+       where account_id = ?1 and cache_key = ?2
+       order by received_at desc, message_id",
+  )?;
+  let rows = statement.query_map(params![account_id, cache_key], |row| {
+    Ok(CachedMessageSummary {
+      id: row.get(0)?,
+      thread_id: row.get(1)?,
+      remote_version: row.get(2)?,
+      subject: row.get(3)?,
+      sender: row.get(4)?,
+      recipients: split_cache_list(row.get::<_, Option<String>>(5)?),
+      snippet: row.get(6)?,
+      received_at: row.get(7)?,
+      is_read: row.get::<_, i64>(8)? != 0,
+      labels: split_cache_list(row.get::<_, Option<String>>(9)?),
+    })
+  })?;
+
+  let mut messages = Vec::new();
+  for row in rows {
+    messages.push(row?);
+  }
+
+  Ok(Some(CachedMessageList {
+    messages,
+    next_page_token,
+  }))
+}
+
+pub fn save_cached_message_summaries(
+  path: &Path,
+  account_id: &str,
+  cache_key: &str,
+  window: CacheWindow<'_>,
+  messages: &[CachedMessageSummary],
+) -> Result<()> {
+  let mut connection = open_database(path)?;
+  initialize_database(&connection)?;
+  let transaction = connection.transaction()?;
+  let now = unix_timestamp();
+
+  transaction.execute(
+    "insert into cache_windows (
+       account_id, cache_key, query, label, from_timestamp, to_timestamp, read_state, cursor, refreshed_at
+     ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+     on conflict(account_id, cache_key) do update set
+       query = excluded.query,
+       label = excluded.label,
+       from_timestamp = excluded.from_timestamp,
+       to_timestamp = excluded.to_timestamp,
+       read_state = excluded.read_state,
+       cursor = excluded.cursor,
+       refreshed_at = excluded.refreshed_at",
+    params![
+      account_id,
+      cache_key,
+      window.query,
+      window.label,
+      window.from_timestamp,
+      window.to_timestamp,
+      window.read_state,
+      window.cursor,
+      now,
+    ],
+  )?;
+
+  transaction.execute(
+    "delete from message_metadata_cache where account_id = ?1 and cache_key = ?2",
+    params![account_id, cache_key],
+  )?;
+
+  for message in messages {
+    transaction.execute(
+      "insert into message_metadata_cache (
+         account_id, cache_key, message_id, thread_id, remote_version, subject, sender, recipients,
+         snippet, received_at, is_read, labels, cached_at
+       ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+      params![
+        account_id,
+        cache_key,
+        &message.id,
+        &message.thread_id,
+        &message.remote_version,
+        &message.subject,
+        &message.sender,
+        join_cache_list(&message.recipients),
+        &message.snippet,
+        &message.received_at,
+        if message.is_read { 1_i64 } else { 0_i64 },
+        join_cache_list(&message.labels),
+        now,
+      ],
+    )?;
+  }
+
+  transaction.commit()?;
+  Ok(())
+}
+
+pub fn load_cached_message_body(
+  path: &Path,
+  account_id: &str,
+  message_id: &str,
+) -> Result<Option<String>> {
+  let connection = open_database(path)?;
+  initialize_database(&connection)?;
+  connection
+    .query_row(
+      "select body from message_body_cache
+       where account_id = ?1 and message_id = ?2 and mime_type = 'application/json'",
+      params![account_id, message_id],
+      |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn save_cached_message_body(
+  path: &Path,
+  account_id: &str,
+  cache_key: Option<&str>,
+  message_id: &str,
+  body_json: &str,
+) -> Result<()> {
+  let connection = open_database(path)?;
+  initialize_database(&connection)?;
+  connection.execute(
+    "insert into message_body_cache (
+       account_id, cache_key, message_id, mime_type, body, fetched_at
+     ) values (?1, ?2, ?3, 'application/json', ?4, ?5)
+     on conflict(account_id, message_id) do update set
+       cache_key = excluded.cache_key,
+       mime_type = excluded.mime_type,
+       body = excluded.body,
+       fetched_at = excluded.fetched_at",
+    params![
+      account_id,
+      cache_key,
+      message_id,
+      body_json,
+      unix_timestamp()
+    ],
+  )?;
+  Ok(())
+}
+
+pub fn update_cached_message_state(
+  path: &Path,
+  account_id: &str,
+  message_id: &str,
+  is_read: bool,
+) -> Result<()> {
+  let mut connection = open_database(path)?;
+  initialize_database(&connection)?;
+  let transaction = connection.transaction()?;
+  let now = unix_timestamp();
+
+  let cached_labels = {
+    let mut statement = transaction.prepare(
+      "select cache_key, labels from message_metadata_cache
+       where account_id = ?1 and message_id = ?2",
+    )?;
+    let rows = statement.query_map(params![account_id, message_id], |row| {
+      Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut labels = Vec::new();
+    for row in rows {
+      labels.push(row?);
+    }
+    labels
+  };
+
+  for (cache_key, labels) in cached_labels {
+    transaction.execute(
+      "update message_metadata_cache
+       set is_read = ?1, labels = ?2, cached_at = ?3
+       where account_id = ?4 and cache_key = ?5 and message_id = ?6",
+      params![
+        if is_read { 1_i64 } else { 0_i64 },
+        labels_after_read_state(labels, is_read),
+        now,
+        account_id,
+        cache_key,
+        message_id
+      ],
+    )?;
+  }
+
+  transaction.execute(
+    "delete from message_metadata_cache
+     where account_id = ?1
+       and cache_key in (
+         select cache_key from cache_windows
+         where account_id = ?1 and read_state is not null
+       )",
+    params![account_id],
+  )?;
+  transaction.execute(
+    "delete from cache_windows where account_id = ?1 and read_state is not null",
+    params![account_id],
+  )?;
+  transaction.execute(
+    "delete from message_body_cache where account_id = ?1 and message_id = ?2",
+    params![account_id, message_id],
+  )?;
+  transaction.execute(
+    "update message_metadata_cache
+     set is_read = ?1, cached_at = ?2
+     where account_id = ?3 and message_id = ?4",
+    params![
+      if is_read { 1_i64 } else { 0_i64 },
+      now,
+      account_id,
+      message_id
+    ],
+  )?;
+  transaction.execute(
+    "insert into message_remote_state (
+       account_id, message_id, is_read, remote_state, marker, updated_at
+     ) values (?1, ?2, ?3, ?4, ?5, ?6)
+     on conflict(account_id, message_id) do update set
+       is_read = excluded.is_read,
+       remote_state = excluded.remote_state,
+       marker = excluded.marker,
+       updated_at = excluded.updated_at",
+    params![
+      account_id,
+      message_id,
+      if is_read { 1_i64 } else { 0_i64 },
+      if is_read { 1_i64 } else { 0_i64 },
+      if is_read { "read" } else { "unread" },
+      now,
+    ],
+  )?;
+  transaction.commit()?;
+  Ok(())
+}
+
+fn delete_cached_account_data(
+  transaction: &rusqlite::Transaction<'_>,
+  account_id: &str,
+) -> Result<()> {
+  for table in [
+    "message_metadata_cache",
+    "message_body_cache",
+    "cache_windows",
+    "message_remote_state",
+    "sync_markers",
+  ] {
+    transaction.execute(
+      &format!("delete from {table} where account_id = ?1"),
+      params![account_id],
+    )?;
+  }
+  Ok(())
 }
 
 impl Provider {
@@ -321,7 +674,14 @@ fn initialize_database(connection: &Connection) -> Result<()> {
     0 => initialize_fresh_schema(connection)?,
     1 => {
       migrate_schema_to_v2(connection)?;
+      migrate_schema_to_v3(connection)?;
+      migrate_schema_to_v4(connection)?;
     }
+    2 => {
+      migrate_schema_to_v3(connection)?;
+      migrate_schema_to_v4(connection)?;
+    }
+    3 => migrate_schema_to_v4(connection)?,
     CURRENT_SCHEMA_VERSION => {}
     other => {
       anyhow::bail!("unsupported database schema version '{other}'")
@@ -370,13 +730,15 @@ fn initialize_fresh_schema(connection: &Connection) -> Result<()> {
            account_id text not null,
            cache_key text not null,
            message_id text not null,
+           thread_id text,
+           remote_version text,
            subject text,
            sender text,
            recipients text,
            snippet text,
            received_at integer,
            is_read integer not null default 0,
-           remote_version text,
+           labels text,
            cached_at integer not null,
            primary key (account_id, cache_key, message_id),
            foreign key (account_id) references accounts(id) on delete cascade
@@ -397,6 +759,7 @@ fn initialize_fresh_schema(connection: &Connection) -> Result<()> {
            account_id text not null,
            cache_key text not null,
            query text,
+           label text,
            from_timestamp integer,
            to_timestamp integer,
            read_state text,
@@ -430,7 +793,7 @@ fn initialize_fresh_schema(connection: &Connection) -> Result<()> {
            version integer not null primary key
          );
 
-         insert into schema_migrations (version) values (2);",
+         insert into schema_migrations (version) values (4);",
   )?;
   Ok(())
 }
@@ -506,6 +869,47 @@ fn migrate_schema_to_v2(connection: &Connection) -> Result<()> {
   Ok(())
 }
 
+fn migrate_schema_to_v3(connection: &Connection) -> Result<()> {
+  if !column_exists(connection, "message_metadata_cache", "thread_id")? {
+    connection.execute(
+      "alter table message_metadata_cache add column thread_id text",
+      [],
+    )?;
+  }
+
+  if !column_exists(connection, "message_metadata_cache", "labels")? {
+    connection.execute(
+      "alter table message_metadata_cache add column labels text",
+      [],
+    )?;
+  }
+
+  connection.execute_batch(
+    "delete from schema_migrations;
+     insert into schema_migrations (version) values (3);",
+  )?;
+  Ok(())
+}
+
+fn migrate_schema_to_v4(connection: &Connection) -> Result<()> {
+  if !column_exists(connection, "message_metadata_cache", "remote_version")? {
+    connection.execute(
+      "alter table message_metadata_cache add column remote_version text",
+      [],
+    )?;
+  }
+
+  if !column_exists(connection, "cache_windows", "label")? {
+    connection.execute("alter table cache_windows add column label text", [])?;
+  }
+
+  connection.execute_batch(
+    "delete from schema_migrations;
+     insert into schema_migrations (version) values (4);",
+  )?;
+  Ok(())
+}
+
 fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
   let exists: Option<String> = connection
     .query_row(
@@ -515,6 +919,75 @@ fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
     )
     .optional()?;
   Ok(exists.is_some())
+}
+
+fn column_exists(connection: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
+  let mut statement = connection.prepare(&format!("pragma table_info({table_name})"))?;
+  let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+  for column in columns {
+    if column? == column_name {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+fn unix_timestamp() -> i64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs() as i64
+}
+
+fn join_cache_list(values: &[String]) -> String {
+  values
+    .iter()
+    .map(|value| value.replace('\\', "\\\\").replace('|', "\\|"))
+    .collect::<Vec<_>>()
+    .join("|")
+}
+
+fn split_cache_list(value: Option<String>) -> Vec<String> {
+  let Some(value) = value else {
+    return Vec::new();
+  };
+
+  let mut values = Vec::new();
+  let mut current = String::new();
+  let mut escaped = false;
+  for character in value.chars() {
+    if escaped {
+      current.push(character);
+      escaped = false;
+      continue;
+    }
+
+    match character {
+      '\\' => escaped = true,
+      '|' => {
+        if !current.is_empty() {
+          values.push(std::mem::take(&mut current));
+        }
+      }
+      _ => current.push(character),
+    }
+  }
+
+  if !current.is_empty() {
+    values.push(current);
+  }
+
+  values
+}
+
+fn labels_after_read_state(labels: Option<String>, is_read: bool) -> String {
+  let mut labels = split_cache_list(labels);
+  if is_read {
+    labels.retain(|label| label != "UNREAD");
+  } else if !labels.iter().any(|label| label == "UNREAD") {
+    labels.push("UNREAD".to_owned());
+  }
+  join_cache_list(&labels)
 }
 
 fn load_permissions(connection: &Connection, account_id: &str) -> Result<Vec<Permission>> {
@@ -565,6 +1038,28 @@ mod tests {
   }
 
   #[test]
+  fn rejects_gmail_accounts_without_oauth_token_auth() {
+    let config = Config {
+      accounts: vec![AccountConfig {
+        id: "gmail".to_owned(),
+        email: "reader@example.com".to_owned(),
+        provider: Provider::Gmail,
+        permissions: vec![Permission::Read],
+        auth: AuthConfig {
+          kind: AuthKind::Password,
+          username: Some("reader@example.com".to_owned()),
+          secret: "secret".to_owned(),
+        },
+      }],
+    };
+
+    assert_eq!(
+      config.validate().unwrap_err().to_string(),
+      "gmail account 'gmail' must use oauth_token auth"
+    );
+  }
+
+  #[test]
   fn saves_and_loads_database() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mmb.db");
@@ -579,7 +1074,7 @@ mod tests {
   }
 
   #[test]
-  fn loads_fresh_schema_version_2() {
+  fn loads_fresh_schema_version_4() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mmb.db");
 
@@ -716,7 +1211,109 @@ mod tests {
       )
       .unwrap();
 
-    assert_eq!(work_cache_count, 1);
+    assert_eq!(work_cache_count, 0);
     assert_eq!(personal_cache_count, 1);
+  }
+
+  #[test]
+  fn caches_message_summaries_and_state_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_cache_roundtrip.db");
+    let config = Config {
+      accounts: vec![account("work")],
+    };
+    config.save(&path).unwrap();
+
+    save_cached_message_summaries(
+      &path,
+      "work",
+      "bounded-window",
+      CacheWindow {
+        query: Some("from:example"),
+        label: Some("INBOX"),
+        from_timestamp: Some(1),
+        to_timestamp: Some(2),
+        read_state: Some("unread"),
+        cursor: None,
+      },
+      &[CachedMessageSummary {
+        id: "message-1".to_owned(),
+        thread_id: Some("thread-1".to_owned()),
+        remote_version: Some("history-1".to_owned()),
+        subject: Some("Subject".to_owned()),
+        sender: Some("sender@example.com".to_owned()),
+        recipients: vec!["reader@example.com".to_owned()],
+        snippet: Some("Snippet".to_owned()),
+        received_at: Some(2),
+        is_read: false,
+        labels: vec!["UNREAD".to_owned(), "INBOX".to_owned()],
+      }],
+    )
+    .unwrap();
+
+    let cached = load_cached_message_summaries(&path, "work", "bounded-window")
+      .unwrap()
+      .unwrap();
+    assert_eq!(cached.messages[0].thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(
+      cached.messages[0].remote_version.as_deref(),
+      Some("history-1")
+    );
+    assert_eq!(cached.messages[0].recipients, vec!["reader@example.com"]);
+
+    update_cached_message_state(&path, "work", "message-1", true).unwrap();
+
+    assert!(
+      load_cached_message_summaries(&path, "work", "bounded-window")
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn caches_message_body_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_body_cache.db");
+    let config = Config {
+      accounts: vec![account("work")],
+    };
+    config.save(&path).unwrap();
+
+    save_cached_message_body(
+      &path,
+      "work",
+      Some("bounded-window"),
+      "message-1",
+      "{\"id\":\"message-1\"}",
+    )
+    .unwrap();
+
+    assert_eq!(
+      load_cached_message_body(&path, "work", "message-1")
+        .unwrap()
+        .as_deref(),
+      Some("{\"id\":\"message-1\"}")
+    );
+  }
+
+  #[test]
+  fn invalidates_cache_when_account_identity_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mmb_identity_change.db");
+    let mut config = Config {
+      accounts: vec![account("work")],
+    };
+    config.save(&path).unwrap();
+
+    save_cached_message_body(&path, "work", None, "message-1", "{\"id\":\"message-1\"}").unwrap();
+
+    config.accounts[0].email = "new-work@example.com".to_owned();
+    config.save(&path).unwrap();
+
+    assert!(
+      load_cached_message_body(&path, "work", "message-1")
+        .unwrap()
+        .is_none()
+    );
   }
 }

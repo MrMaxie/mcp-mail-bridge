@@ -1,14 +1,14 @@
 # McpMailBridge
 
-McpMailBridge is a Rust MCP server for local mail account access. It exposes a stdio MCP server, stores account settings in a local SQLite database, and enforces per-account permissions before mail tools run.
+McpMailBridge is a Rust MCP server for local Gmail account access. It exposes a stdio MCP server, stores account settings and OAuth credential material in a local SQLite database, and enforces per-account permissions before mail tools run.
 
-The mail backend is still a stub. Account management, permission checks, the MCP tool surface, and the terminal account UI are in place.
+Version 1.0 focuses on Gmail. IMAP/SMTP and Microsoft 365 account types are accepted by configuration for future compatibility, but Gmail is the implemented provider.
 
 ## Storage
 
 Account data is stored in `mmb.db` next to the executable by default. Use `--database <path>` to point the CLI, TUI, or MCP server at another SQLite database.
 
-Do not commit `mmb.db`. It may contain secrets, OAuth tokens, or passwords once accounts are configured.
+Do not commit `mmb.db`. It can contain OAuth access tokens, refresh tokens, client credentials, cached message metadata, and cached message bodies.
 
 ## Commands
 
@@ -41,6 +41,7 @@ Use a specific database:
 
 ```sh
 cargo run -- --database ./mmb.db config list
+cargo run -- --database ./mmb.db serve
 ```
 
 Open the terminal UI:
@@ -49,9 +50,78 @@ Open the terminal UI:
 cargo run -- tui
 ```
 
-In the TUI, `Account id` is a local alias used by CLI commands and MCP requests. It is not the account's email address. Use a short stable value such as `work`, `personal`, or `gmail-main`.
+## Gmail Account Setup
 
-TUI account form controls:
+Use `Provider = gmail` and `Auth kind = oauth_token`.
+
+For local testing, the account secret can be either a short-lived Gmail OAuth access token or a JSON OAuth token bundle. `cargo run -- config add` can create this bundle through Google's device OAuth flow, or you can paste an existing local bundle. A bundle lets the server refresh access tokens without repeating local login:
+
+```json
+{
+  "access_token": "optional-current-access-token",
+  "refresh_token": "local-refresh-token",
+  "client_id": "local-oauth-client-id",
+  "client_secret": "local-oauth-client-secret",
+  "expires_at_unix": 1770000000
+}
+```
+
+Store that JSON only through the CLI or TUI prompt so it lands in the local SQLite database. If `token_uri` is present, it must be `https://oauth2.googleapis.com/token`; custom token endpoints are rejected so refresh credentials are not sent to non-Google hosts. Do not paste real tokens into chat, README examples, Linear, GitHub, logs, or tracked files.
+
+`Account id` is a local alias used by CLI commands and MCP requests. It is not the account email address. Use a short stable value such as `work`, `personal`, or `gmail-main`.
+
+The Gmail adapter validates that the authenticated Gmail profile email matches the configured account email before mail operations run.
+
+## Permissions
+
+Accounts can have these permissions:
+
+- `search` - list/search bounded message summaries.
+- `read` - read one selected message body.
+- `send` - send mail from the account.
+- `mark_as_read` - mark one selected message as read.
+- `mark_as_unread` - mark one selected message as unread.
+
+For compatibility, stored `read` permissions also allow summary search/listing, and legacy stored `write` permissions load as `send`.
+
+## MCP Tools
+
+The server registers these tools:
+
+- `list_accounts`
+- `list_messages`
+- `read_message`
+- `send_message`
+- `mark_as_read`
+- `mark_as_unread`
+
+`list_messages` requires `account_id` and accepts:
+
+- `query`
+- `label`: one Gmail label/mailbox atom such as `INBOX`, `SENT`, or a custom label id
+- `start_unix`
+- `end_unix`
+- `read_state`: `read` or `unread`
+- `limit`
+- `page_token`
+
+When `start_unix` and `end_unix` are both omitted, the server uses a safe default window covering the last 30 days. If one bound is provided, both must be provided. Any requested window wider than 90 days is rejected. Search/list responses return summaries only and never message bodies.
+
+`read_message` requires `account_id` and `message_id`. Bodies are fetched only for the selected message and cached locally after a successful provider read.
+
+`send_message` requires `account_id`, `to`, `subject`, and a non-empty `body`. It also accepts optional `cc`, `bcc`, and `body_format` values. Supported body formats are `text/plain`, `plain`, `text/html`, and `html`. Recipient and header fields reject unsafe control characters, line breaks, non-ASCII header text, and malformed recipient addresses.
+
+`mark_as_read` and `mark_as_unread` require `account_id` and `message_id`. They mutate one selected message only and update local cached state after Gmail confirms the change.
+
+## Cache Behavior
+
+McpMailBridge stores bounded summary windows, fetched message bodies, remote version markers, and message read state in SQLite. The cache is keyed by account id, query, Gmail label id, date window, read-state filter, limit, and page token.
+
+There is no fetch-all mailbox path. Cache entries are created from bounded list/search requests or explicit reads of one message id. Cached message bodies can be returned when metadata refresh is temporarily unavailable; a Gmail `not found` response is still reported as an error.
+
+## TUI Controls
+
+In the TUI account form:
 
 - `Tab` or down arrow moves to the next field.
 - Up arrow moves to the previous field.
@@ -60,27 +130,39 @@ TUI account form controls:
 - Enter saves.
 - Esc cancels.
 
-## MCP tools
+## MCP Client Example
 
-The server currently registers these tools:
+Use stdio transport and pass the database path if the client should not use the executable-adjacent default:
 
-- `list_accounts`
-- `list_messages`
-- `read_message`
-- `send_message`
-- `mark_as_read`
+```json
+{
+  "mcpServers": {
+    "mcp-mail-bridge": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--",
+        "--database",
+        "./mmb.db",
+        "serve"
+      ]
+    }
+  }
+}
+```
 
-Mail operations return placeholder responses until provider-specific backends are added. Permission checks already run against configured accounts.
+The example contains no credentials. Account setup stays in the local database.
 
-## Project layout
+## Project Layout
 
 - `src/main.rs` wires CLI parsing, tracing, and command dispatch.
 - `src/cli.rs` contains non-interactive account commands and account prompts.
-- `src/config.rs` owns account types, validation, database path resolution, and SQLite persistence.
+- `src/config.rs` owns account types, validation, database path resolution, SQLite persistence, migrations, and local mail cache persistence.
 - `src/permissions.rs` defines account permissions.
+- `src/mail.rs` defines the mail adapter contract and Gmail implementation.
 - `src/mcp.rs` registers MCP tools and serves stdio transport.
 - `src/tui.rs` contains the terminal account manager.
 
-## Notes for contributors
+## Notes For Contributors
 
-Keep credentials out of tracked files, examples, tests, logs, and issue comments. Use `cargo add crate@=x.y.z` for new dependencies so dependency changes stay explicit.
+Keep credentials out of tracked files, examples, tests, logs, issue comments, and chat output. Use `cargo add crate@=x.y.z` for new dependencies so dependency changes stay explicit.

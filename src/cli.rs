@@ -1,11 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::{
+  fmt,
+  path::{Path, PathBuf},
+  thread,
+  time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use inquire::{Confirm, MultiSelect, Password, Select, Text};
+use reqwest::{StatusCode, blocking::Client};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{AccountConfig, AuthConfig, AuthKind, Config, Provider};
 use crate::permissions::Permission;
+
+const GMAIL_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
+const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GMAIL_PROFILE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/profile";
+const GMAIL_SCOPE: &str =
+  "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
 
 #[derive(Debug, Parser)]
 #[command(version, about = "MCP stdio bridge for configured mail accounts")]
@@ -131,9 +144,10 @@ pub fn prompt_account(existing: Option<AccountConfig>) -> Result<AccountConfig> 
   let username = Text::new("Username")
     .with_initial_value(existing_username)
     .prompt()?;
-  let secret = Password::new("Secret or token")
-    .without_confirmation()
-    .prompt()?;
+  let secret = prompt_secret(provider, auth_kind, &email)?;
+  if provider == Provider::Gmail && auth_kind == AuthKind::OAuthToken {
+    validate_gmail_identity(&email, &secret)?;
+  }
   let permissions = MultiSelect::new("Permissions", Permission::variants()).prompt()?;
 
   Ok(AccountConfig {
@@ -147,4 +161,216 @@ pub fn prompt_account(existing: Option<AccountConfig>) -> Result<AccountConfig> 
       secret,
     },
   })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GmailOAuthMode {
+  DeviceLogin,
+  PasteSecret,
+}
+
+impl fmt::Display for GmailOAuthMode {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::DeviceLogin => formatter.write_str("Run Gmail device OAuth login"),
+      Self::PasteSecret => formatter.write_str("Paste existing token or token bundle"),
+    }
+  }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+  device_code: String,
+  user_code: String,
+  verification_url: String,
+  expires_in: u64,
+  interval: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenResponse {
+  access_token: String,
+  refresh_token: Option<String>,
+  expires_in: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthErrorResponse {
+  error: String,
+  error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OAuthTokenBundle {
+  access_token: Option<String>,
+  refresh_token: String,
+  client_id: String,
+  client_secret: String,
+  token_uri: Option<String>,
+  expires_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GmailProfileResponse {
+  email_address: String,
+}
+
+fn prompt_secret(provider: Provider, auth_kind: AuthKind, email: &str) -> Result<String> {
+  if provider != Provider::Gmail || auth_kind != AuthKind::OAuthToken {
+    return Password::new("Secret or token")
+      .without_confirmation()
+      .prompt()
+      .map_err(Into::into);
+  }
+
+  let mode = Select::new(
+    "Gmail OAuth setup",
+    vec![GmailOAuthMode::DeviceLogin, GmailOAuthMode::PasteSecret],
+  )
+  .prompt()?;
+
+  match mode {
+    GmailOAuthMode::DeviceLogin => run_gmail_device_login(email),
+    GmailOAuthMode::PasteSecret => Password::new("OAuth access token or token bundle JSON")
+      .without_confirmation()
+      .prompt()
+      .map_err(Into::into),
+  }
+}
+
+fn run_gmail_device_login(_email: &str) -> Result<String> {
+  let client_id = Text::new("Google OAuth client id").prompt()?;
+  let client_secret = Password::new("Google OAuth client secret")
+    .without_confirmation()
+    .prompt()?;
+  let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+  let device = client
+    .post(GMAIL_DEVICE_CODE_URL)
+    .form(&[("client_id", client_id.as_str()), ("scope", GMAIL_SCOPE)])
+    .send()?
+    .error_for_status()?
+    .json::<DeviceCodeResponse>()?;
+
+  println!("Open this URL locally: {}", device.verification_url);
+  println!("Enter this code: {}", device.user_code);
+  println!("Waiting for Google authorization to complete...");
+
+  let started = Instant::now();
+  let mut interval = Duration::from_secs(device.interval.unwrap_or(5).max(1));
+  loop {
+    if started.elapsed() >= Duration::from_secs(device.expires_in) {
+      anyhow::bail!("Gmail OAuth device code expired before authorization completed");
+    }
+
+    thread::sleep(interval);
+    let response = client
+      .post(GMAIL_TOKEN_URL)
+      .form(&[
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+        ("device_code", device.device_code.as_str()),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+      ])
+      .send()?;
+
+    if response.status() == StatusCode::OK {
+      let token = response.json::<DeviceTokenResponse>()?;
+      let refresh_token = token.refresh_token.ok_or_else(|| {
+        anyhow::anyhow!("Google did not return a refresh token; retry with offline access enabled")
+      })?;
+      let expires_at_unix = token
+        .expires_in
+        .map(|seconds| unix_timestamp() + seconds as i64);
+      let bundle = OAuthTokenBundle {
+        access_token: Some(token.access_token),
+        refresh_token,
+        client_id,
+        client_secret,
+        token_uri: Some(GMAIL_TOKEN_URL.to_owned()),
+        expires_at_unix,
+      };
+      return serde_json::to_string(&bundle).map_err(Into::into);
+    }
+
+    let status = response.status();
+    let error = response.json::<OAuthErrorResponse>().ok();
+    match error.as_ref().map(|error| error.error.as_str()) {
+      Some("authorization_pending") => {}
+      Some("slow_down") => interval += Duration::from_secs(5),
+      Some("access_denied") => anyhow::bail!("Gmail OAuth authorization was denied"),
+      Some("expired_token") => anyhow::bail!("Gmail OAuth device code expired"),
+      Some(other) => {
+        let description = error
+          .as_ref()
+          .and_then(|error| error.error_description.as_deref())
+          .unwrap_or("no additional description");
+        anyhow::bail!("Gmail OAuth failed with redacted error '{other}': {description}");
+      }
+      None => anyhow::bail!("Gmail OAuth failed with HTTP status {status}"),
+    }
+  }
+}
+
+fn validate_gmail_identity(expected_email: &str, secret: &str) -> Result<()> {
+  let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
+  let access_token = gmail_access_token(&client, secret)?;
+  let profile = client
+    .get(GMAIL_PROFILE_URL)
+    .bearer_auth(access_token)
+    .send()?
+    .error_for_status()?
+    .json::<GmailProfileResponse>()?;
+
+  if !profile.email_address.eq_ignore_ascii_case(expected_email) {
+    anyhow::bail!("authenticated Gmail account does not match configured account email");
+  }
+
+  Ok(())
+}
+
+fn gmail_access_token(client: &Client, secret: &str) -> Result<String> {
+  let trimmed = secret.trim();
+  if trimmed.is_empty() {
+    anyhow::bail!("Gmail OAuth token cannot be empty");
+  }
+  if !trimmed.starts_with('{') {
+    return Ok(trimmed.to_owned());
+  }
+
+  let bundle = serde_json::from_str::<OAuthTokenBundle>(trimmed)?;
+  if let Some(access_token) = bundle.access_token.as_ref()
+    && bundle
+      .expires_at_unix
+      .map(|expires_at| expires_at > unix_timestamp() + 60)
+      .unwrap_or(true)
+  {
+    return Ok(access_token.clone());
+  }
+
+  let token_uri = bundle.token_uri.as_deref().unwrap_or(GMAIL_TOKEN_URL);
+  if token_uri != GMAIL_TOKEN_URL {
+    anyhow::bail!("oauth token bundle token_uri must be https://oauth2.googleapis.com/token");
+  }
+
+  let response = client
+    .post(token_uri)
+    .form(&[
+      ("grant_type", "refresh_token"),
+      ("refresh_token", bundle.refresh_token.as_str()),
+      ("client_id", bundle.client_id.as_str()),
+      ("client_secret", bundle.client_secret.as_str()),
+    ])
+    .send()?
+    .error_for_status()?
+    .json::<DeviceTokenResponse>()?;
+
+  Ok(response.access_token)
+}
+
+fn unix_timestamp() -> i64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs() as i64
 }
