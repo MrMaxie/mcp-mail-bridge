@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+  path::PathBuf,
+  sync::mpsc::{self, TryRecvError},
+  thread,
+  time::Duration,
+};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +22,8 @@ use crate::{
 };
 
 const FIELD_COUNT: usize = 7;
+const VALIDATION_TICK: Duration = Duration::from_millis(100);
+const VALIDATION_SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
 struct TerminalGuard;
 
@@ -44,6 +51,7 @@ struct App {
 enum Mode {
   List,
   Form(AccountForm),
+  Validating(ValidationState),
 }
 
 #[derive(Clone)]
@@ -59,6 +67,14 @@ struct AccountForm {
   permission_focus: usize,
   focus: usize,
   message: String,
+}
+
+struct ValidationState {
+  form: AccountForm,
+  original_id: Option<String>,
+  account: AccountConfig,
+  receiver: mpsc::Receiver<Result<(), mail::MailError>>,
+  spinner_index: usize,
 }
 
 impl App {
@@ -111,14 +127,48 @@ impl App {
     }
   }
 
-  fn save_form(&mut self, form: AccountForm) -> Result<()> {
+  fn begin_save_form(&mut self, form: AccountForm) -> Result<()> {
     let original_id = form.original_id.clone();
-    let account = form.into_account();
-    let id = account.id.clone();
+    let account = form.clone().into_account();
 
-    if account.provider == Provider::Gmail && account.auth.kind == AuthKind::OAuthToken {
-      mail::validate_gmail_identity_blocking(&account.email, &account.auth.secret)?;
+    if requires_gmail_identity_validation(&account) {
+      self.start_gmail_identity_validation(form, original_id, account);
+      return Ok(());
     }
+
+    self.finish_save_form(original_id, account)
+  }
+
+  fn start_gmail_identity_validation(
+    &mut self,
+    form: AccountForm,
+    original_id: Option<String>,
+    account: AccountConfig,
+  ) {
+    let expected_email = account.email.clone();
+    let secret = account.auth.secret.clone();
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+      let result = mail::validate_gmail_identity_blocking(&expected_email, &secret);
+      let _ = sender.send(result);
+    });
+
+    self.mode = Mode::Validating(ValidationState {
+      form,
+      original_id,
+      account,
+      receiver,
+      spinner_index: 0,
+    });
+  }
+
+  fn finish_save_form(
+    &mut self,
+    original_id: Option<String>,
+    account: AccountConfig,
+  ) -> Result<()> {
+    let id = account.id.clone();
 
     if let Some(original_id) = original_id
       && original_id != id
@@ -137,6 +187,60 @@ impl App {
     self.message = format!("Saved account '{id}'.");
     self.mode = Mode::List;
     Ok(())
+  }
+
+  fn poll_validation(&mut self) {
+    let outcome = match &mut self.mode {
+      Mode::Validating(state) => {
+        state.advance_spinner();
+        match state.receiver.try_recv() {
+          Ok(result) => Some(result),
+          Err(TryRecvError::Empty) => None,
+          Err(TryRecvError::Disconnected) => Some(Err(mail::MailError::RequestFailed(
+            "gmail identity validation was interrupted".to_owned(),
+          ))),
+        }
+      }
+      Mode::List | Mode::Form(_) => None,
+    };
+
+    let Some(outcome) = outcome else {
+      return;
+    };
+
+    let mode = std::mem::replace(&mut self.mode, Mode::List);
+    let Mode::Validating(state) = mode else {
+      return;
+    };
+
+    match outcome {
+      Ok(()) => {
+        let retry_form = state.form;
+        if let Err(error) = self.finish_save_form(state.original_id, state.account) {
+          self.mode = Mode::Form(retry_form);
+          if let Mode::Form(form) = &mut self.mode {
+            form.message = format!("Error: {error}");
+          }
+        }
+      }
+      Err(error) => {
+        self.mode = Mode::Form(state.form);
+        if let Mode::Form(form) = &mut self.mode {
+          form.message = gmail_validation_failure_message(&error);
+        }
+      }
+    }
+  }
+
+  fn cancel_validation(&mut self) {
+    let mode = std::mem::replace(&mut self.mode, Mode::List);
+    if let Mode::Validating(state) = mode {
+      self.mode = Mode::Form(state.form);
+      if let Mode::Form(form) = &mut self.mode {
+        form.message =
+          "Validation canceled. Press Enter to try again or Esc to discard changes.".to_owned();
+      }
+    }
   }
 }
 
@@ -311,14 +415,37 @@ enum FormAction {
   Cancel,
 }
 
+impl ValidationState {
+  fn advance_spinner(&mut self) {
+    self.spinner_index = (self.spinner_index + 1) % VALIDATION_SPINNER.len();
+  }
+
+  fn message(&self) -> String {
+    format!(
+      "{} Validating Gmail identity with Google. Press Esc to cancel.",
+      VALIDATION_SPINNER[self.spinner_index]
+    )
+  }
+}
+
 pub fn run(database_path: PathBuf) -> Result<()> {
   let mut app = App::load(database_path)?;
   let (_guard, mut terminal) = TerminalGuard::enter();
 
   loop {
+    app.poll_validation();
     terminal.draw(|frame| render(frame, &app))?;
 
-    if let Event::Key(key) = event::read()? {
+    let event = if matches!(app.mode, Mode::Validating(_)) {
+      if !event::poll(VALIDATION_TICK)? {
+        continue;
+      }
+      event::read()?
+    } else {
+      event::read()?
+    };
+
+    if let Event::Key(key) = event {
       if key.kind != KeyEventKind::Press {
         continue;
       }
@@ -342,7 +469,7 @@ pub fn run(database_path: PathBuf) -> Result<()> {
             let form = std::mem::replace(&mut app.mode, Mode::List);
             if let Mode::Form(form) = form {
               let retry_form = form.clone();
-              if let Err(error) = app.save_form(form) {
+              if let Err(error) = app.begin_save_form(form) {
                 app.mode = Mode::Form(retry_form);
                 if let Mode::Form(form) = &mut app.mode {
                   form.message = format!("Error: {error}");
@@ -351,6 +478,11 @@ pub fn run(database_path: PathBuf) -> Result<()> {
             }
           }
         },
+        Mode::Validating(_) => {
+          if key.code == KeyCode::Esc {
+            app.cancel_validation();
+          }
+        }
       }
     }
   }
@@ -367,11 +499,13 @@ fn render(frame: &mut Frame, app: &App) {
   match &app.mode {
     Mode::List => render_account_list(frame, areas[0], app),
     Mode::Form(form) => render_form(frame, areas[0], form),
+    Mode::Validating(state) => render_form(frame, areas[0], &state.form),
   }
 
   let help_text = match &app.mode {
-    Mode::List => app.message.as_str(),
-    Mode::Form(form) => form.message.as_str(),
+    Mode::List => app.message.clone(),
+    Mode::Form(form) => form.message.clone(),
+    Mode::Validating(state) => state.message(),
   };
   let help = Paragraph::new(Line::from(help_text)).block(Block::default().borders(Borders::ALL));
 
@@ -554,5 +688,116 @@ fn is_quit_key(key: KeyEvent) -> bool {
 fn handle_result(app: &mut App, action: impl FnOnce(&mut App) -> Result<()>) {
   if let Err(error) = action(app) {
     app.message = format!("Error: {error}");
+  }
+}
+
+fn requires_gmail_identity_validation(account: &AccountConfig) -> bool {
+  account.provider == Provider::Gmail && account.auth.kind == AuthKind::OAuthToken
+}
+
+fn gmail_validation_failure_message(error: &mail::MailError) -> String {
+  match error {
+    mail::MailError::Authorization => {
+      "Gmail identity validation failed. Google rejected the OAuth token; refresh or re-issue the OAuth token bundle, then try again.".to_owned()
+    }
+    mail::MailError::MissingSecret => {
+      "Gmail identity validation failed. Paste a Gmail OAuth token or token bundle, then try again.".to_owned()
+    }
+    mail::MailError::InvalidRequest(message) => {
+      format!("Gmail identity validation failed. {message}")
+    }
+    mail::MailError::Transport(_) => {
+      "Gmail identity validation failed. Google could not be reached; check your network connection, then try again.".to_owned()
+    }
+    mail::MailError::ServiceUnavailable => {
+      "Gmail identity validation failed. Gmail is unavailable right now; wait a moment, then try again.".to_owned()
+    }
+    mail::MailError::NotFound => {
+      "Gmail identity validation failed. Google could not find the Gmail profile; re-issue the OAuth token bundle for this account, then try again.".to_owned()
+    }
+    mail::MailError::RequestFailed(_) => {
+      "Gmail identity validation failed. The Gmail response could not be read; try again, then re-issue the OAuth token bundle if it keeps failing.".to_owned()
+    }
+    mail::MailError::UnsupportedProvider(_) | mail::MailError::UnsupportedAuthKind(_) => {
+      "Gmail identity validation failed. Review the provider and auth kind, then try again."
+        .to_owned()
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn account(provider: Provider, auth_kind: AuthKind) -> AccountConfig {
+    AccountConfig {
+      id: "gmail".to_owned(),
+      email: "user@example.com".to_owned(),
+      provider,
+      permissions: vec![Permission::Read],
+      auth: AuthConfig {
+        kind: auth_kind,
+        username: None,
+        secret: "local-secret".to_owned(),
+      },
+    }
+  }
+
+  #[test]
+  fn gmail_oauth_accounts_require_identity_validation() {
+    assert!(requires_gmail_identity_validation(&account(
+      Provider::Gmail,
+      AuthKind::OAuthToken
+    )));
+    assert!(!requires_gmail_identity_validation(&account(
+      Provider::Gmail,
+      AuthKind::Password
+    )));
+    assert!(!requires_gmail_identity_validation(&account(
+      Provider::ImapSmtp,
+      AuthKind::OAuthToken
+    )));
+  }
+
+  #[test]
+  fn gmail_validation_message_hides_transport_details() {
+    let message = gmail_validation_failure_message(&mail::MailError::Transport(
+      "failed with refresh-token and client-secret".to_owned(),
+    ));
+
+    assert!(message.contains("check your network connection"));
+    assert!(!message.contains("refresh-token"));
+    assert!(!message.contains("client-secret"));
+  }
+
+  #[test]
+  fn gmail_validation_message_hides_request_details() {
+    let message = gmail_validation_failure_message(&mail::MailError::RequestFailed(
+      "bad response with access-token".to_owned(),
+    ));
+
+    assert!(message.contains("try again"));
+    assert!(!message.contains("access-token"));
+  }
+
+  #[test]
+  fn gmail_validation_message_gives_auth_next_action() {
+    let message = gmail_validation_failure_message(&mail::MailError::Authorization);
+
+    assert!(message.contains("refresh or re-issue the OAuth token bundle"));
+  }
+
+  #[test]
+  fn gmail_validation_message_gives_missing_secret_next_action() {
+    let message = gmail_validation_failure_message(&mail::MailError::MissingSecret);
+
+    assert!(message.contains("Paste a Gmail OAuth token or token bundle"));
+  }
+
+  #[test]
+  fn gmail_validation_message_gives_service_next_action() {
+    let message = gmail_validation_failure_message(&mail::MailError::ServiceUnavailable);
+
+    assert!(message.contains("wait a moment"));
   }
 }
