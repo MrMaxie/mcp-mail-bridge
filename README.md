@@ -1,16 +1,36 @@
 # McpMailBridge
 
-McpMailBridge is a local MCP server for mail accounts. It runs over stdio, keeps account state in SQLite, and checks per-account permissions before it lists, reads, sends, or changes mail state.
+McpMailBridge is a local MCP server for mail accounts. It runs over stdio, stores account state in SQLite, and checks account permissions before it lists, reads, sends, or changes mail.
 
-Gmail is the only implemented provider in `1.0.0`. The config model already has room for IMAP/SMTP and Microsoft 365 accounts, but those providers are not wired to mail transport yet.
+## Status
+
+| Area | Current state |
+| --- | --- |
+| Transport | MCP over stdio |
+| Database | SQLite file, `mmb.db` next to the executable by default |
+| Working provider | Gmail with OAuth token bundles |
+| Config-only providers | IMAP/SMTP and Microsoft 365 are modeled but not wired to mail transport |
+| Local UI | Interactive terminal UI for account management |
+
+## How It Fits Together
+
+```mermaid
+flowchart LR
+  Client["MCP client"] -->|"stdio"| Server["McpMailBridge"]
+  Server -->|"read config, write cache"| Database["SQLite mmb.db"]
+  Server -->|"OAuth token bundle"| Gmail["Gmail API"]
+  Server -->|"permission checks"| Tools["MCP tools"]
+```
 
 ## Requirements
 
-- Rust toolchain with edition 2024 support
-- A Google OAuth client if you want to use Gmail device login
-- An MCP client that can start a stdio server
+- Rust toolchain with edition 2024 support.
+- Google OAuth client credentials for Gmail device login.
+- An MCP client that can launch a stdio server.
 
-## Build and Check
+## Quick Start
+
+Build and verify the project:
 
 ```sh
 cargo build
@@ -19,9 +39,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-## Configure Accounts
-
-Account data is stored in `mmb.db` next to the executable by default. Use `--database <path>` for a separate local database during development or recovery work.
+Create or edit accounts:
 
 ```sh
 cargo run -- config add
@@ -31,35 +49,39 @@ cargo run -- config remove <account-id>
 cargo run -- config check
 ```
 
-For Gmail accounts, use:
-
-- provider: `gmail`
-- auth kind: `oauth_token`
-- account id: a short local alias, for example `work` or `personal`
-
-The account id is not the Gmail address. MCP clients pass it as `account_id`.
-
-`cargo run -- config add` can run Google's device OAuth flow and store the resulting token bundle in SQLite. You can also paste a local OAuth token bundle when prompted. Do not put real tokens, OAuth client secrets, mailbox content, or `mmb.db` files in git, chat, issues, PRs, logs, or docs.
-
-## Run
-
-Start the MCP server:
+Run the server:
 
 ```sh
 cargo run -- serve
 ```
 
-Open the terminal UI for account management:
+Open the terminal UI:
 
 ```sh
 cargo run -- tui
 ```
 
-Use an explicit database path when the MCP client should not use the default database:
+Use a separate local database when testing:
 
 ```sh
 cargo run -- --database ./.local/dev.mmb.db serve
 ```
+
+## Account Setup
+
+Account data lives in SQLite. Use `--database <path>` to point the CLI or server at another database file.
+
+For Gmail, use these values when prompted:
+
+| Field | Value |
+| --- | --- |
+| Provider | `gmail` |
+| Auth kind | `oauth_token` |
+| Account id | A local alias such as `work` or `personal` |
+
+The account id is not the Gmail address. MCP clients pass the alias as `account_id`.
+
+`cargo run -- config add` can run Google's device OAuth flow and store the token bundle. You can also paste an existing local OAuth token bundle when prompted.
 
 ## MCP Client Config
 
@@ -76,61 +98,97 @@ Use stdio transport:
 }
 ```
 
-This config contains no credentials. Account setup stays in SQLite.
+This config contains no credentials. Credentials stay in SQLite.
 
-## Tools
+## MCP Tools
 
-| MCP tool | Permission | Behavior |
+| Tool | Permission | Purpose |
 | --- | --- | --- |
-| `list_accounts` | none | Lists configured accounts without secrets. |
+| `list_accounts` | None | Lists configured accounts without secrets. |
 | `list_messages` | `search` | Lists bounded message summaries. |
 | `read_message` | `read` | Reads one selected message body. |
 | `send_message` | `send` | Sends one message from the account. |
 | `mark_as_read` | `mark_as_read` | Marks one selected message as read. |
 | `mark_as_unread` | `mark_as_unread` | Marks one selected message as unread. |
 
-Stored `read` permissions also allow summary listing for compatibility. Legacy stored `write` permissions load as `send`.
+Compatibility rules:
 
-## Message Listing
+- Stored `read` permission also allows summary listing.
+- Legacy stored `write` permission loads as `send`.
 
-`list_messages` requires `account_id` and accepts:
+## Message Requests
 
-- `query`
-- `label`, for example `INBOX`, `SENT`, or a Gmail label id
-- `start_unix` and `end_unix`
-- `read_state`, either `read` or `unread`
-- `limit`
-- `page_token`
+`list_messages` requires `account_id`.
 
-If no time window is supplied, McpMailBridge searches the last 30 days. If one bound is supplied, both bounds are required. Windows wider than 90 days are rejected.
+Optional filters:
 
-Listing returns summaries only. `read_message` fetches a body only for the requested `message_id`.
+| Field | Notes |
+| --- | --- |
+| `query` | Provider search query. |
+| `label` | Gmail label such as `INBOX`, `SENT`, or a label id. |
+| `start_unix`, `end_unix` | Supply both bounds together. |
+| `read_state` | `read` or `unread`. |
+| `limit` | Defaults to 25 and clamps to 1-50. |
+| `page_token` | Provider pagination token. |
 
-## Cache Rules
+Window rules:
 
-McpMailBridge caches bounded message lists, selected message bodies, remote version markers, and read state in SQLite.
-
-The server reads cache data only after transient Gmail availability or transport failures. Authentication failures, identity mismatches, rejected requests, and missing messages return errors instead of stale cache data. Cached responses use `source = "gmail-cache"`.
+- No time window means the last 30 days.
+- A single time bound is rejected.
+- Windows wider than 90 days are rejected.
+- Listing returns summaries only. `read_message` fetches a body only for the requested `message_id`.
 
 ## Sending Mail
 
-`send_message` requires `account_id`, `to`, `subject`, and a non-empty `body`. It also accepts `cc`, `bcc`, and `body_format`.
+`send_message` requires:
+
+- `account_id`
+- `to`
+- `subject`
+- non-empty `body`
+
+Optional fields:
+
+- `cc`
+- `bcc`
+- `body_format`
 
 Supported body formats:
 
-- `text/plain`
-- `plain`
-- `text/html`
-- `html`
+| Input | Sent as |
+| --- | --- |
+| `text/plain` | Plain text |
+| `plain` | Plain text |
+| `text/html` | HTML |
+| `html` | HTML |
 
 Recipient and header fields reject control characters, line breaks, non-ASCII header text, and malformed recipient addresses.
 
+## Cache Behavior
+
+McpMailBridge caches bounded message lists, selected message bodies, remote version markers, and read state in SQLite.
+
+| Situation | Behavior |
+| --- | --- |
+| Gmail is temporarily unavailable | Falls back to compatible cached data when available. |
+| Network transport fails | Falls back to compatible cached data when available. |
+| Authentication fails | Returns an error. |
+| Account identity does not match | Returns an error. |
+| Request is rejected | Returns an error. |
+| Message is missing | Returns an error. |
+
+Cached responses set `source` to `gmail-cache`.
+
 ## Development Notes
 
-- Keep credentials, local databases, logs, screenshots, and scratch output out of git.
-- Keep local notes and development databases under `.local/`.
-- Add dependencies with exact versions, for example `cargo add crate@=x.y.z`.
 - Keep MCP transport on stdio unless a human explicitly asks for another transport.
+- Keep local notes and development databases under `.local/`.
+- Keep credentials, local databases, logs, screenshots, and scratch output out of git.
+- Add dependencies with exact versions, for example `cargo add crate@=x.y.z`.
+
+## Secrets
+
+Do not put real tokens, OAuth client secrets, mailbox content, or `mmb.db` files in git, chat, issues, pull requests, logs, or docs.
 
 ## License
 
