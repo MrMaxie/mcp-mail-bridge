@@ -578,7 +578,13 @@ fn render_form(frame: &mut Frame, area: ratatui::layout::Rect, form: &AccountFor
       "Left/right changes value.",
     ),
     form_line(4, form.focus, "Username", &form.username, ""),
-    form_line(5, form.focus, "Secret or token", &secret, ""),
+    form_line(
+      5,
+      form.focus,
+      "Secret or token",
+      &secret,
+      "OAuth bundles without expires_at_unix refresh immediately.",
+    ),
     form_line(
       6,
       form.focus,

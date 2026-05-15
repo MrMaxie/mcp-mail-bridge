@@ -83,6 +83,10 @@ The account id is not the Gmail address. MCP clients pass the alias as `account_
 
 `cargo run -- config add` can run Google's device OAuth flow and store the token bundle. You can also paste an existing local OAuth token bundle when prompted.
 
+`expires_at_unix` is optional in pasted OAuth token bundles. When a bundle includes `access_token` but omits `expires_at_unix`, McpMailBridge treats the cached access token as stale and refreshes immediately with the refresh token. When `expires_at_unix` is present, the cached access token is used only if it remains valid for more than the 60-second refresh safety window.
+
+Store token bundle JSON only through the CLI or TUI prompt so it lands in the local SQLite database. If `token_uri` is present, it must be `https://oauth2.googleapis.com/token`; custom token endpoints are rejected before refresh credentials are used so they are not sent to non-Google hosts. Do not paste real tokens into chat, README examples, Linear, GitHub, logs, or tracked files.
+
 ## MCP Client Config
 
 Use stdio transport:

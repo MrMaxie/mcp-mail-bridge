@@ -21,6 +21,7 @@ const MAX_WINDOW_DAYS: i64 = 90;
 const DEFAULT_WINDOW_DAYS: i64 = 30;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const GMAIL_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const GMAIL_METADATA_FIELDS: &str =
   "id,threadId,historyId,snippet,labelIds,internalDate,payload/headers";
 const SUMMARY_FETCH_CONCURRENCY: usize = 5;
@@ -345,6 +346,7 @@ impl GmailCredential {
           "oauth token bundle must include refresh_token, client_id, and client_secret".to_owned(),
         ));
       }
+      bundle.validated_token_uri()?;
       return Ok(Self::Refreshable(bundle));
     }
 
@@ -355,11 +357,9 @@ impl GmailCredential {
     match self {
       Self::AccessToken(token) => Ok(token.clone()),
       Self::Refreshable(bundle) => {
-        if let Some(access_token) = bundle.access_token.as_ref()
-          && let Some(expires_at) = bundle.expires_at_unix
-          && expires_at > MessageDateWindow::now_unix() + 60
+        if let Some(access_token) = bundle.valid_cached_access_token(MessageDateWindow::now_unix())
         {
-          return Ok(access_token.clone());
+          return Ok(access_token.to_owned());
         }
 
         #[derive(Deserialize)]
@@ -391,6 +391,20 @@ impl GmailCredential {
 }
 
 impl OAuthTokenBundle {
+  fn valid_cached_access_token(&self, now_unix: i64) -> Option<&str> {
+    let access_token = self.access_token.as_deref()?.trim();
+    if access_token.is_empty() {
+      return None;
+    }
+
+    let expires_at = self.expires_at_unix?;
+    if expires_at > now_unix + ACCESS_TOKEN_REFRESH_SKEW_SECONDS {
+      Some(access_token)
+    } else {
+      None
+    }
+  }
+
   fn validated_token_uri(&self) -> Result<&str, MailError> {
     let Some(token_uri) = self.token_uri.as_deref() else {
       return Ok(GMAIL_TOKEN_URL);
@@ -400,9 +414,9 @@ impl OAuthTokenBundle {
       return Ok(token_uri);
     }
 
-    Err(MailError::InvalidRequest(
-      "oauth token bundle token_uri must be https://oauth2.googleapis.com/token".to_owned(),
-    ))
+    Err(MailError::InvalidRequest(format!(
+      "oauth token bundle token_uri must be {GMAIL_TOKEN_URL}"
+    )))
   }
 }
 
@@ -434,11 +448,8 @@ fn gmail_access_token_blocking(client: &BlockingClient, secret: &str) -> Result<
   match GmailCredential::parse(secret)? {
     GmailCredential::AccessToken(token) => Ok(token),
     GmailCredential::Refreshable(bundle) => {
-      if let Some(access_token) = bundle.access_token.as_ref()
-        && let Some(expires_at) = bundle.expires_at_unix
-        && expires_at > MessageDateWindow::now_unix() + 60
-      {
-        return Ok(access_token.clone());
+      if let Some(access_token) = bundle.valid_cached_access_token(MessageDateWindow::now_unix()) {
+        return Ok(access_token.to_owned());
       }
 
       #[derive(Deserialize)]
@@ -1375,6 +1386,44 @@ mod tests {
   }
 
   #[test]
+  fn missing_bundle_expiry_treats_cached_access_token_as_stale() {
+    let bundle = OAuthTokenBundle {
+      access_token: Some("cached-access-token".to_owned()),
+      refresh_token: "refresh-token".to_owned(),
+      client_id: "client-id".to_owned(),
+      client_secret: "client-secret".to_owned(),
+      token_uri: Some(GMAIL_TOKEN_URL.to_owned()),
+      expires_at_unix: None,
+    };
+
+    assert_eq!(bundle.valid_cached_access_token(1_770_000_000), None);
+  }
+
+  #[test]
+  fn bundle_access_token_must_outlive_refresh_skew() {
+    let mut bundle = OAuthTokenBundle {
+      access_token: Some("cached-access-token".to_owned()),
+      refresh_token: "refresh-token".to_owned(),
+      client_id: "client-id".to_owned(),
+      client_secret: "client-secret".to_owned(),
+      token_uri: Some(GMAIL_TOKEN_URL.to_owned()),
+      expires_at_unix: Some(1_770_000_061),
+    };
+
+    assert_eq!(
+      bundle.valid_cached_access_token(1_770_000_000),
+      Some("cached-access-token")
+    );
+
+    bundle.expires_at_unix = Some(1_770_000_060);
+    assert_eq!(bundle.valid_cached_access_token(1_770_000_000), None);
+
+    bundle.access_token = Some("   ".to_owned());
+    bundle.expires_at_unix = Some(1_770_000_061);
+    assert_eq!(bundle.valid_cached_access_token(1_770_000_000), None);
+  }
+
+  #[test]
   fn gmail_profile_email_mismatch_gives_next_action() {
     assert_eq!(
       validate_gmail_profile_email("expected@example.com", "other@example.com"),
@@ -1386,26 +1435,33 @@ mod tests {
 
   #[test]
   fn rejects_custom_oauth_token_uri() {
+    assert!(matches!(
+      GmailCredential::parse(
+        r#"{
+          "refresh_token": "refresh-token",
+          "client_id": "client-id",
+          "client_secret": "client-secret",
+          "token_uri": "https://example.com/token"
+        }"#,
+      ),
+      Err(MailError::InvalidRequest(message))
+        if message == format!("oauth token bundle token_uri must be {GMAIL_TOKEN_URL}")
+    ));
+  }
+
+  #[test]
+  fn accepts_google_oauth_token_uri() {
     let credential = GmailCredential::parse(
       r#"{
         "refresh_token": "refresh-token",
         "client_id": "client-id",
         "client_secret": "client-secret",
-        "token_uri": "https://example.com/token"
+        "token_uri": "https://oauth2.googleapis.com/token"
       }"#,
     )
     .expect("oauth bundle should parse");
 
-    let GmailCredential::Refreshable(bundle) = credential else {
-      panic!("expected refreshable bundle");
-    };
-
-    assert_eq!(
-      bundle.validated_token_uri(),
-      Err(MailError::InvalidRequest(
-        "oauth token bundle token_uri must be https://oauth2.googleapis.com/token".to_owned()
-      ))
-    );
+    assert!(matches!(credential, GmailCredential::Refreshable(_)));
   }
 
   #[test]
