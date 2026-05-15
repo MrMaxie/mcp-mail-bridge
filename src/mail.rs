@@ -439,11 +439,7 @@ pub(crate) fn validate_gmail_identity_blocking(
     .json::<GmailProfileResponse>()
     .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-  if !profile.email_address.eq_ignore_ascii_case(expected_email) {
-    return Err(MailError::InvalidRequest(
-      "authenticated Gmail account does not match configured account email".to_owned(),
-    ));
-  }
+  validate_gmail_profile_email(expected_email, &profile.email_address)?;
 
   Ok(())
 }
@@ -889,11 +885,7 @@ impl MailAdapter for GmailAdapter {
         .await
         .map_err(|error| MailError::RequestFailed(error.to_string()))?;
 
-      if !profile.email_address.eq_ignore_ascii_case(&expected_email) {
-        return Err(MailError::InvalidRequest(
-          "authenticated Gmail account does not match configured account email".to_owned(),
-        ));
-      }
+      validate_gmail_profile_email(&expected_email, &profile.email_address)?;
 
       Ok(ValidationResult {
         provider_account: profile.email_address,
@@ -1197,6 +1189,19 @@ struct GmailProfileResponse {
   email_address: String,
 }
 
+fn validate_gmail_profile_email(
+  expected_email: &str,
+  profile_email: &str,
+) -> Result<(), MailError> {
+  if profile_email.eq_ignore_ascii_case(expected_email) {
+    return Ok(());
+  }
+
+  Err(MailError::InvalidRequest(
+    "authenticated Gmail account does not match configured account email; re-issue the OAuth token bundle for the configured Gmail address, then try again".to_owned(),
+  ))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GmailMessageListResponse {
@@ -1416,6 +1421,16 @@ mod tests {
     bundle.access_token = Some("   ".to_owned());
     bundle.expires_at_unix = Some(1_770_000_061);
     assert_eq!(bundle.valid_cached_access_token(1_770_000_000), None);
+  }
+
+  #[test]
+  fn gmail_profile_email_mismatch_gives_next_action() {
+    assert_eq!(
+      validate_gmail_profile_email("expected@example.com", "other@example.com"),
+      Err(MailError::InvalidRequest(
+        "authenticated Gmail account does not match configured account email; re-issue the OAuth token bundle for the configured Gmail address, then try again".to_owned()
+      ))
+    );
   }
 
   #[test]
